@@ -1,13 +1,49 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
-// Get a free hosted Postgres database in seconds: `npx create-db`
-
 generator client {
-  provider = "prisma-client"
-  output   = "../app/generated/prisma"
+  provider = "prisma-client-js"
 }
 
+// Prisma 7 dropped `url = env(...)` inside schema.prisma — the
+// connection URL is now declared in prisma.config.ts (datasource.url)
+// for migrations / db push, and passed to `new PrismaClient({ adapter })`
+// at runtime via @prisma/adapter-pg.
 datasource db {
   provider = "postgresql"
+}
+
+model Paper {
+  id            String   @id @default(cuid())
+  title         String
+  abstract      String   @db.Text
+  authors       String[]
+  year          Int?
+  journal       String?
+  doi           String?  @unique
+  arxivId       String?  @unique
+  openAlexId    String?  @unique
+  url           String?
+  pdfUrl        String?
+  isOpenAccess  Boolean  @default(false)
+  citationCount Int      @default(0)
+  fields        String[]
+  keywords      String[]
+  submittedVia  String?  @default("agent")
+  publishedAt   DateTime?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([title])
+  @@index([year])
+  @@index([citationCount])
+}
+
+model Researcher {
+  id          String   @id @default(cuid())
+  name        String
+  institution String?
+  email       String?
+  website     String?
+  paperCount  Int      @default(0)
+  createdAt   DateTime @default(now())
+
+  @@index([name])
 }

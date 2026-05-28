@@ -1,101 +1,136 @@
-import Image from "next/image";
+// maxpaper homepage. Server component — the search box is a plain
+// HTML <form action="/search" method="GET"> that GETs to /search?q=…
+// The /search route doesn't exist yet; submitting will 404 until the
+// search backend is built. Honest signal that's the next thing.
 
 export default function Home() {
   return (
-    <div className="grid grid-rows-[20px_1fr_20px] items-center justify-items-center min-h-screen p-8 pb-20 gap-16 sm:p-20 font-[family-name:var(--font-geist-sans)]">
-      <main className="flex flex-col gap-8 row-start-2 items-center sm:items-start">
-        <Image
-          className="dark:invert"
-          src="https://nextjs.org/icons/next.svg"
-          alt="Next.js logo"
-          width={180}
-          height={38}
-          priority
-        />
-        <ol className="list-inside list-decimal text-sm text-center sm:text-left font-[family-name:var(--font-geist-mono)]">
-          <li className="mb-2">
-            Get started by editing{" "}
-            <code className="bg-black/[.05] dark:bg-white/[.06] px-1 py-0.5 rounded font-semibold">
-              app/page.tsx
-            </code>
-            .
-          </li>
-          <li>Save and see your changes instantly.</li>
-        </ol>
-
-        <div className="flex gap-4 items-center flex-col sm:flex-row">
+    <main style={{ maxWidth: 680, margin: "0 auto", padding: "0 20px" }}>
+      <nav
+        style={{
+          borderBottom: "0.5px solid #e8e0c8",
+          padding: "12px 0",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          marginBottom: 0,
+        }}
+      >
+        <div
+          style={{
+            fontSize: 15,
+            fontWeight: 500,
+            color: "#111",
+            letterSpacing: "-.01em",
+          }}
+        >
+          maxpaper
+        </div>
+        <div style={{ display: "flex", gap: 20 }}>
           <a
-            className="rounded-full border border-solid border-transparent transition-colors flex items-center justify-center bg-foreground text-background gap-2 hover:bg-[#383838] dark:hover:bg-[#ccc] text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
+            href="/browse"
+            style={{ fontSize: 12, color: "#888", textDecoration: "none" }}
           >
-            <Image
-              className="dark:invert"
-              src="https://nextjs.org/icons/vercel.svg"
-              alt="Vercel logomark"
-              width={20}
-              height={20}
-            />
-            Deploy now
+            Browse
           </a>
           <a
-            className="rounded-full border border-solid border-black/[.08] dark:border-white/[.145] transition-colors flex items-center justify-center hover:bg-[#f2f2f2] dark:hover:bg-[#1a1a1a] hover:border-transparent text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 sm:min-w-44"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
+            href="/researchers"
+            style={{ fontSize: 12, color: "#888", textDecoration: "none" }}
           >
-            Read our docs
+            Researchers
+          </a>
+          <a
+            href="/developer"
+            style={{ fontSize: 12, color: "#888", textDecoration: "none" }}
+          >
+            Developer
           </a>
         </div>
-      </main>
-      <footer className="row-start-3 flex gap-6 flex-wrap items-center justify-center">
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
+      </nav>
+
+      <div
+        style={{
+          padding: "48px 0 32px",
+          textAlign: "center",
+          borderBottom: "0.5px solid #e8e0c8",
+        }}
+      >
+        <div
+          style={{
+            fontSize: 11,
+            fontWeight: 500,
+            letterSpacing: ".1em",
+            textTransform: "uppercase",
+            color: "#c8a84b",
+            marginBottom: 12,
+          }}
         >
-          <Image
-            aria-hidden
-            src="https://nextjs.org/icons/file.svg"
-            alt="File icon"
-            width={16}
-            height={16}
-          />
-          Learn
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
+          50 million+ research papers
+        </div>
+        <h1
+          style={{
+            fontSize: 28,
+            fontWeight: 500,
+            color: "#111",
+            letterSpacing: "-.03em",
+            marginBottom: 8,
+            lineHeight: 1.2,
+          }}
         >
-          <Image
-            aria-hidden
-            src="https://nextjs.org/icons/window.svg"
-            alt="Window icon"
-            width={16}
-            height={16}
-          />
-          Examples
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="https://nextjs.org/icons/globe.svg"
-            alt="Globe icon"
-            width={16}
-            height={16}
-          />
-          Go to nextjs.org →
-        </a>
-      </footer>
-    </div>
+          Ask science anything.
+          <br />
+          Get a real answer.
+        </h1>
+        <p style={{ fontSize: 13, color: "#888", marginBottom: 24 }}>
+          Search in plain English. Free.
+        </p>
+        <SearchBox />
+      </div>
+    </main>
+  );
+}
+
+function SearchBox() {
+  return (
+    <form
+      action="/search"
+      method="GET"
+      style={{
+        display: "flex",
+        maxWidth: 480,
+        margin: "0 auto",
+        border: "0.5px solid #e8e0c8",
+      }}
+    >
+      <input
+        type="text"
+        name="q"
+        autoComplete="off"
+        placeholder="e.g. tactile sensing for humanoid robots"
+        style={{
+          flex: 1,
+          padding: "12px 14px",
+          fontSize: 13,
+          border: "none",
+          outline: "none",
+          background: "#fff",
+        }}
+      />
+      <button
+        type="submit"
+        style={{
+          padding: "12px 22px",
+          background: "#111",
+          color: "#fff",
+          border: "none",
+          cursor: "pointer",
+          fontSize: 12,
+          fontWeight: 500,
+          letterSpacing: ".02em",
+        }}
+      >
+        Search
+      </button>
+    </form>
   );
 }

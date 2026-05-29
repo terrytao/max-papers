@@ -505,6 +505,399 @@ server.tool(
   },
 );
 
+// ── find_candidates ────────────────────────────────────────────────
+// Returns visibility-public/open ResearchProfile rows with full
+// detail. Mirrors the homepage talent rail's candidate query —
+// visibility:private rows are never returned by this tool (clients
+// that need aggregate-only counts should hit the homepage's
+// /api/talent/matches endpoint instead).
+server.tool(
+  "find_candidates",
+  "Find researchers openly looking for positions, matched by research topic. Only returns public/open profiles — private researchers' details are never exposed via MCP.",
+  {
+    topics: z.array(z.string()).optional(),
+    lookingFor: z
+      .enum(["phd", "postdoc", "faculty", "industry", "any"])
+      .optional(),
+    institution: z.string().optional(),
+    limit: z.number().optional().default(10),
+  },
+  async ({ topics, lookingFor, institution, limit }) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const where: any = {
+      visibility: { in: ["public", "open"] },
+      lookingFor: { isEmpty: false },
+    };
+    if (lookingFor && lookingFor !== "any") {
+      where.lookingFor = { has: lookingFor };
+    }
+    if (institution) {
+      where.institution = { contains: institution, mode: "insensitive" };
+    }
+    if (topics?.length) {
+      where.papers = {
+        some: {
+          paper: {
+            OR: [
+              { keywords: { hasSome: topics.map((t) => t.toLowerCase()) } },
+              { fields: { hasSome: topics } },
+            ],
+          },
+        },
+      };
+    }
+    const candidates = await prisma.researchProfile.findMany({
+      where,
+      take: Math.min(limit ?? 10, 20),
+      orderBy: { totalCitations: "desc" },
+      include: {
+        papers: {
+          include: {
+            paper: {
+              select: {
+                title: true,
+                citationCount: true,
+                journal: true,
+                year: true,
+              },
+            },
+          },
+          orderBy: { paper: { citationCount: "desc" } },
+          take: 1,
+        },
+      },
+    });
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              count: candidates.length,
+              source: "max-papers.com/talent",
+              results: candidates.map((c) => ({
+                name: c.name,
+                institution: c.institution,
+                title: c.title,
+                lookingFor: c.lookingFor,
+                availableFrom: c.availableFrom?.toISOString().split("T")[0] ?? null,
+                paperCount: c.paperCount,
+                totalCitations: c.totalCitations,
+                hIndex: c.hIndex,
+                topPaper: c.papers[0]?.paper?.title ?? null,
+                url: `https://www.max-papers.com/researchers/${c.id}`,
+              })),
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  },
+);
+
+// ── submit_position ────────────────────────────────────────────────
+// Posts a new Position via a singleton "MCP submission" profile so
+// the talent UI's owner-scoped filtering keeps working without
+// per-poster ResearchProfile creation.
+server.tool(
+  "submit_position",
+  "Post a new research position on max-papers.com. Goes live immediately.",
+  {
+    title: z.string(),
+    type: z.enum(["phd", "postdoc", "faculty", "job", "fellowship"]),
+    institution: z.string(),
+    description: z.string(),
+    researchTopics: z.array(z.string()).optional(),
+    country: z.string().optional(),
+    funded: z.boolean().optional().default(true),
+    deadline: z.string().optional(),
+    contactEmail: z.string().optional(),
+    website: z.string().optional(),
+  },
+  async ({
+    title,
+    type,
+    institution,
+    description,
+    researchTopics,
+    country,
+    funded,
+    deadline,
+    contactEmail,
+    website,
+  }) => {
+    const profile = await prisma.researchProfile.upsert({
+      where: { email: "mcp@max-papers.com" },
+      create: {
+        email: "mcp@max-papers.com",
+        name: "MCP submission",
+        profileType: "system",
+      },
+      update: {},
+      select: { id: true },
+    });
+    let deadlineDate: Date | null = null;
+    if (deadline) {
+      const d = new Date(deadline);
+      deadlineDate = Number.isNaN(d.getTime()) ? null : d;
+    }
+    const position = await prisma.position.create({
+      data: {
+        title: title.slice(0, 300),
+        type,
+        institution: institution.slice(0, 200),
+        description: description.slice(0, 10_000),
+        researchTopics: (researchTopics ?? []).slice(0, 20),
+        methods: [],
+        requirements: [],
+        country: country ?? null,
+        funded: funded ?? true,
+        deadline: deadlineDate,
+        contactEmail: contactEmail ?? null,
+        website: website ?? null,
+        status: "open",
+        postedById: profile.id,
+        source: "mcp",
+      },
+      select: { id: true, title: true },
+    });
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              status: "live",
+              message: "✅ Position is now live on max-papers.com",
+              title: position.title,
+              url: `https://www.max-papers.com/talent/positions/${position.id}`,
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  },
+);
+
+// ── search_researchers ─────────────────────────────────────────────
+// Searches the auto-extracted Researcher table (every author with at
+// least one paper). Distinct from find_candidates which is the
+// opt-in ResearchProfile set.
+server.tool(
+  "search_researchers",
+  "Find researchers in the maxpaper index by name or institution. Indexes every author with at least one paper.",
+  {
+    name: z.string().optional(),
+    institution: z.string().optional(),
+    field: z
+      .string()
+      .optional()
+      .describe("Research field — matches against Researcher.fields"),
+    limit: z.number().optional().default(10),
+  },
+  async ({ name, institution, field, limit }) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const where: any = {};
+    if (name) where.name = { contains: name, mode: "insensitive" };
+    if (institution) {
+      where.institution = { contains: institution, mode: "insensitive" };
+    }
+    if (field) where.fields = { has: field };
+    const researchers = await prisma.researcher.findMany({
+      where,
+      take: Math.min(limit ?? 10, 20),
+      orderBy: [{ paperCount: "desc" }, { citationCount: "desc" }],
+      select: {
+        id: true,
+        name: true,
+        institution: true,
+        paperCount: true,
+        citationCount: true,
+        fields: true,
+      },
+    });
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              count: researchers.length,
+              source: "max-papers.com",
+              results: researchers.map((r) => ({
+                name: r.name,
+                institution: r.institution,
+                paperCount: r.paperCount,
+                citationCount: r.citationCount,
+                fields: r.fields,
+                url: `https://www.max-papers.com/researchers/${r.id}`,
+              })),
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  },
+);
+
+// ── search_institutes ──────────────────────────────────────────────
+// Note: Institute rows are intentionally sparse in v1. Author
+// affiliations aren't in the OpenAlex ingest path; extraction is
+// done heuristically by agents/extract-entities.ts via Haiku. Expect
+// thin coverage until a proper affiliation pipeline ships.
+server.tool(
+  "search_institutes",
+  "Find research institutes / universities / labs in the maxpaper index.",
+  {
+    name: z.string().optional(),
+    country: z.string().optional(),
+    limit: z.number().optional().default(10),
+  },
+  async ({ name, country, limit }) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const where: any = {};
+    if (name) where.name = { contains: name, mode: "insensitive" };
+    if (country) where.country = { contains: country, mode: "insensitive" };
+    const institutes = await prisma.institute.findMany({
+      where,
+      take: Math.min(limit ?? 10, 20),
+      orderBy: { paperCount: "desc" },
+      select: {
+        id: true,
+        name: true,
+        slug: true,
+        country: true,
+        paperCount: true,
+      },
+    });
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              count: institutes.length,
+              source: "max-papers.com",
+              results: institutes.map((i) => ({
+                name: i.name,
+                country: i.country,
+                paperCount: i.paperCount,
+                // Wiki page uses slug, not id — important not to
+                // hand out 404 URLs.
+                url: `https://www.max-papers.com/institutes/${i.slug}`,
+              })),
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  },
+);
+
+// ── get_pdf_url ────────────────────────────────────────────────────
+// Returns a free-PDF URL when one is available. Order of preference:
+// stored Paper.pdfUrl → arxiv.org/pdf when arxivId is known →
+// nothing (with the publisher DOI returned so the caller can decide
+// what to do). Doesn't currently call Unpaywall — that's a planned
+// addition once we wire its API key.
+server.tool(
+  "get_pdf_url",
+  "Find a free PDF URL for a paper by Paper.id, DOI, or arXiv ID. Returns the stored pdfUrl when present; falls back to arxiv.org for arXiv papers; otherwise returns the DOI publisher URL.",
+  {
+    paperId: z.string().optional(),
+    doi: z.string().optional(),
+    arxivId: z.string().optional(),
+  },
+  async ({ paperId, doi, arxivId }) => {
+    const ors: Array<Record<string, string>> = [];
+    if (paperId) ors.push({ id: paperId });
+    if (doi) ors.push({ doi });
+    if (arxivId) ors.push({ arxivId });
+    if (ors.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              error: "Provide paperId, doi, or arxivId",
+            }),
+          },
+        ],
+      };
+    }
+    const paper = await prisma.paper.findFirst({
+      where: { OR: ors },
+      select: {
+        id: true,
+        title: true,
+        pdfUrl: true,
+        arxivId: true,
+        doi: true,
+        isOpenAccess: true,
+      },
+    });
+    if (!paper) {
+      return {
+        content: [
+          { type: "text", text: JSON.stringify({ error: "Paper not found" }) },
+        ],
+      };
+    }
+    if (paper.pdfUrl) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              pdfUrl: paper.pdfUrl,
+              source: "direct",
+              isOpenAccess: paper.isOpenAccess,
+              title: paper.title,
+            }),
+          },
+        ],
+      };
+    }
+    if (paper.arxivId) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              pdfUrl: `https://arxiv.org/pdf/${paper.arxivId}`,
+              source: "arXiv",
+              isOpenAccess: true,
+              title: paper.title,
+            }),
+          },
+        ],
+      };
+    }
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            error: "No free PDF found",
+            title: paper.title,
+            doi: paper.doi,
+            publisherUrl: paper.doi ? `https://doi.org/${paper.doi}` : null,
+            note: "Try the publisher URL via your institution's subscription, or use submit_paper to add an arxivId if a free preprint exists.",
+          }),
+        },
+      ],
+    };
+  },
+);
+
 const transport = new StdioServerTransport();
 await server.connect(transport);
 console.error("max-papers MCP server running (stdio)");

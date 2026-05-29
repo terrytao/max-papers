@@ -60,6 +60,12 @@ async function extractFilters(query: string): Promise<Filters> {
 
 Query: "${query}"
 
+For author names: extract even partial names — first names only,
+last names only, or any combination is fine. The DB does partial
+matching, so "Hinton" → author: "Hinton", "Geoffrey" → author:
+"Geoffrey", "LeCun" → author: "LeCun", "Geoffrey Hinton" → author:
+"Geoffrey Hinton". Don't over-normalize — return what the user typed.
+
 Return exactly this JSON structure:
 {
   "topic": "main topic to search for",
@@ -114,32 +120,69 @@ function tokenizeTopic(topic: string): string[] {
   ).slice(0, 6); // cap so a paragraph-length topic doesn't explode the query
 }
 
-function buildWhere(f: Filters): Prisma.PaperWhereInput {
+// Partial author-name search via raw SQL — Prisma's `{ authors:
+// { has: ... } }` is exact-string-match against array elements, so
+// "Hinton" won't find "Geoffrey Hinton". Postgres `unnest` + ILIKE
+// does case-insensitive substring match against each author entry.
+// Returns the matching paper ids so the main query can intersect via
+// `id: { in: ... }` and keep using its normal ordering / pagination.
+async function findPapersByPartialAuthor(author: string): Promise<string[]> {
+  // 2-char floor stops a stray 1-letter query from scanning everyone.
+  if (author.length < 2) return [];
+  // Escape LIKE metacharacters in user input before wrapping in % .. %
+  const pattern = `%${author.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+  const rows = await prisma.$queryRaw<Array<{ id: string }>>`
+    SELECT id FROM "Paper"
+    WHERE EXISTS (
+      SELECT 1 FROM unnest(authors) AS author_name
+      WHERE author_name ILIKE ${pattern}
+    )
+    LIMIT 500
+  `;
+  return rows.map((r) => r.id);
+}
+
+async function buildWhere(f: Filters): Promise<Prisma.PaperWhereInput> {
   const where: Prisma.PaperWhereInput = {};
+  const ands: Prisma.PaperWhereInput[] = [];
+
   const topic = f.topic?.trim();
   if (topic) {
     const tokens = tokenizeTopic(topic);
     if (tokens.length > 0) {
       // AND across tokens (each significant word must appear somewhere),
       // OR within each token (title OR abstract OR keywords).
-      where.AND = tokens.map((tok) => ({
-        OR: [
-          { title: { contains: tok, mode: "insensitive" as const } },
-          { abstract: { contains: tok, mode: "insensitive" as const } },
-          { keywords: { has: tok } },
-        ],
-      }));
+      for (const tok of tokens) {
+        ands.push({
+          OR: [
+            { title: { contains: tok, mode: "insensitive" as const } },
+            { abstract: { contains: tok, mode: "insensitive" as const } },
+            { keywords: { has: tok } },
+          ],
+        });
+      }
     } else {
       // Topic was all stopwords — fall back to a literal contains so
       // the query still does something instead of returning everything.
-      where.OR = [
-        { title: { contains: topic, mode: "insensitive" } },
-        { abstract: { contains: topic, mode: "insensitive" } },
-      ];
+      ands.push({
+        OR: [
+          { title: { contains: topic, mode: "insensitive" } },
+          { abstract: { contains: topic, mode: "insensitive" } },
+        ],
+      });
     }
   }
+
   const author = f.author?.trim();
-  if (author) where.authors = { has: author };
+  if (author) {
+    const ids = await findPapersByPartialAuthor(author);
+    // Even when no author matches, push an empty `id IN ()` so the
+    // author filter genuinely scopes the query (rather than silently
+    // returning unrelated papers that match only the topic).
+    ands.push({ id: { in: ids } });
+  }
+
+  if (ands.length > 0) where.AND = ands;
   if (typeof f.afterYear === "number" && f.afterYear > 1900) {
     where.year = { gte: f.afterYear };
   }
@@ -201,7 +244,7 @@ export async function POST(req: NextRequest) {
     console.error("[search] extraction failed:", (err as Error).message);
   }
 
-  const where = buildWhere(filters ?? { topic: query });
+  const where = await buildWhere(filters ?? { topic: query });
   const [papers, total] = await Promise.all([
     prisma.paper.findMany({
       where,

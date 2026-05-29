@@ -54,6 +54,25 @@ const server = new McpServer({
   description: "Search the maxpaper research index in plain English",
 });
 
+// Partial author-name search via raw SQL. Prisma's `{ authors:
+// { has: ... } }` is exact-match against array elements; this does
+// case-insensitive substring match against each author entry, so
+// "Hinton" finds "Geoffrey Hinton". 2-char floor + LIMIT 500 guard
+// against pathological scans.
+async function findPapersByPartialAuthor(author: string): Promise<string[]> {
+  if (author.length < 2) return [];
+  const pattern = `%${author.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+  const rows = await prisma.$queryRaw<Array<{ id: string }>>`
+    SELECT id FROM "Paper"
+    WHERE EXISTS (
+      SELECT 1 FROM unnest(authors) AS author_name
+      WHERE author_name ILIKE ${pattern}
+    )
+    LIMIT 500
+  `;
+  return rows.map((r) => r.id);
+}
+
 server.tool(
   "search_papers",
   "Search research papers by topic, author, year, journal, or any natural-language query. Returns up to 20 results sorted by citation count.",
@@ -79,14 +98,22 @@ server.tool(
   async ({ query, author, afterYear, journal, openAccess, limit }) => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const where: any = {};
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const ands: any[] = [];
     if (query) {
-      where.OR = [
-        { title: { contains: query, mode: "insensitive" } },
-        { abstract: { contains: query, mode: "insensitive" } },
-        { keywords: { has: query.toLowerCase() } },
-      ];
+      ands.push({
+        OR: [
+          { title: { contains: query, mode: "insensitive" } },
+          { abstract: { contains: query, mode: "insensitive" } },
+          { keywords: { has: query.toLowerCase() } },
+        ],
+      });
     }
-    if (author) where.authors = { has: author };
+    if (author) {
+      const ids = await findPapersByPartialAuthor(author);
+      ands.push({ id: { in: ids } });
+    }
+    if (ands.length > 0) where.AND = ands;
     if (afterYear) where.year = { gte: afterYear };
     if (journal) where.journal = { contains: journal, mode: "insensitive" };
     if (openAccess) where.isOpenAccess = true;

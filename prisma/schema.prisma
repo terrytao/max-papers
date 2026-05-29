@@ -189,6 +189,13 @@ model Position {
   // open | closed | filled — closed positions stop appearing in
   // search but stay readable at /talent/positions/[id].
   status         String          @default("open")
+  // Provenance — distinguishes user-posted from crawled rows.
+  // Values: "manual" (default; created via /api/talent/positions),
+  // "crawled" (agents/crawl-jobs.ts), "import" (one-off batch).
+  source         String?         @default("manual")
+  // Original URL of the listing page the row was extracted from
+  // (vs `website` which is the position's own page when present).
+  sourceUrl      String?
   postedById     String
   postedBy       ResearchProfile @relation(fields: [postedById], references: [id], onDelete: Cascade)
   applications   Application[]

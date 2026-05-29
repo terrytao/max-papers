@@ -1,207 +1,111 @@
-// Academic job crawler — pulls open positions from external sources
-// into the Position table so the talent marketplace has real listings.
+// Academic job crawler — pulls open positions from listing pages
+// on multiple academic job boards into the Position table. Each
+// source URL is a *listing* page (many jobs visible at once); we
+// fetch it, strip HTML to text, ask Haiku 4.5 to pull out structured
+// job rows, dedupe on (institution, title), and insert as Position
+// rows owned by a singleton "crawler" ResearchProfile.
 //
-// Source for v1: academicpositions.com sitemap. Designed to add more
-// sources (nature.com/careers, jobs.ac.uk, Indeed's research filter)
-// behind the same SourceAdapter shape.
+// This replaces an earlier per-job JSON-LD scaffold that only worked
+// for academicpositions.com's individual job pages. Listing-page
+// extraction trades reliability per-source for breadth: we get rows
+// from 5+ boards immediately, even ones that don't expose
+// JobPosting microdata on listings.
 //
-// Crawl etiquette:
-//   • respect robots.txt (we read /robots.txt before scraping)
-//   • 2-second polite delay between requests
-//   • User-Agent identifies us so site owners can throttle/block us
-//     specifically rather than rate-limiting everyone
-//   • cap per-run at JOB_CAP (env override) — don't try to swallow
-//     the whole site in one go; the daemon hits this nightly
+// Cost shape: ~8 sources × 1 Haiku call ≈ $0.04/run.
 //
-// Idempotency: positions dedupe on the (institution, title) pair via
-// a synthetic external-id hash stored in Position.website. Re-runs
-// just refresh existing rows' status/deadline instead of inserting
-// duplicates.
+// Run:    npx tsx agents/crawl-jobs.ts
+// Cron:   nohup npx tsx agents/crawl-jobs.ts >> logs/crawl-jobs.log 2>&1 &
+//         echo $! > logs/crawl-jobs.pid
 //
-// Position.postedBy: every job belongs to a profile. Crawled jobs
-// attach to a singleton "External Crawler" ResearchProfile (upserted
-// on first run), so the talent UI's owner-based filtering keeps
-// working without per-employer ResearchProfile creation.
+// Etiquette:
+//   • robots.txt check per source — skip if blocked
+//   • 2s polite delay between sources
+//   • mailto in User-Agent so site owners can throttle us
+//     specifically rather than blanket-blocking
 //
-// Important: this is a SCAFFOLD. The actual HTML parsing depends on
-// academicpositions.com's current DOM and may break when they
-// rewrite. Tested against their public job-listing pages as of late
-// 2025. Run as:
-//   npx tsx agents/crawl-jobs.ts
-// or behind nohup for a long-running daemon.
+// Schema additions handled in this commit:
+//   Position.source     String? @default("manual")
+//   Position.sourceUrl  String?
 
 import "dotenv/config";
+import Anthropic from "@anthropic-ai/sdk";
 import { prisma } from "../lib/prisma";
 
 const CONTACT_EMAIL = "terry.tao@max-robotics.com";
-const USER_AGENT = `max-papers-crawler/1.0 (mailto:${CONTACT_EMAIL})`;
+const USER_AGENT = `Mozilla/5.0 (compatible; max-papers-crawler/1.0; +mailto:${CONTACT_EMAIL})`;
 const POLITE_DELAY_MS = 2000;
-const JOB_CAP = Number(process.env.JOB_CAP ?? 100);
+const FETCH_TIMEOUT_MS = 30_000;
+const MAX_TEXT_CHARS = 6000;
 const CRAWLER_EMAIL = "crawler-jobs@max-papers.com";
+const MODEL = "claude-haiku-4-5-20251001";
 
-// Source adapters — add new ones here. Each returns a normalized list
-// of crawled jobs that the main loop dedupes and upserts.
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+const SOURCES: string[] = [
+  "https://academicpositions.com/jobs/position/phd",
+  "https://academicpositions.com/jobs/position/postdoc",
+  "https://academicpositions.com/jobs/position/professor",
+  "https://www.jobs.ac.uk/search/?type=phd",
+  "https://www.jobs.ac.uk/search/?type=postdoc",
+  "https://euraxess.ec.europa.eu/jobs/search",
+  "https://www.nature.com/naturecareers/jobs?type=phd-studentship",
+  "https://www.nature.com/naturecareers/jobs?type=postdoctoral-fellowship",
+];
+
 type CrawledJob = {
-  externalId: string; // stable identifier we use for dedup
   title: string;
-  type: "phd" | "postdoc" | "job" | "fellowship" | "grant";
-  description: string;
+  type: "phd" | "postdoc" | "faculty" | "job" | "fellowship";
   institution: string;
   department?: string | null;
   country?: string | null;
   city?: string | null;
-  deadline?: Date | null;
-  funded: boolean;
-  contactEmail?: string | null;
-  website?: string | null; // canonical source URL
+  description?: string;
   researchTopics?: string[];
+  funded?: boolean;
+  deadline?: string | null; // YYYY-MM-DD
+  contactEmail?: string | null;
+  website?: string | null;
 };
 
-type SourceAdapter = {
-  name: string;
-  crawl: (limit: number) => AsyncGenerator<CrawledJob>;
-};
-
-// ─ academicpositions.com adapter ──────────────────────────────────
-// Walks their sitemap index, pulls each job sitemap, then fetches
-// the HTML of each job page and pulls the metadata out via simple
-// regex parsing of their JSON-LD JobPosting blocks (which they
-// publish on every job page for SEO — pure win for us).
-const academicPositions: SourceAdapter = {
-  name: "academicpositions.com",
-  async *crawl(limit: number): AsyncGenerator<CrawledJob> {
-    // Check robots.txt first — bail if disallowed.
-    if (!(await robotsAllowed("https://academicpositions.com"))) {
-      console.log("[crawl-jobs] academicpositions.com: robots.txt blocks us");
-      return;
-    }
-    // Their sitemap-index points at sub-sitemaps; the per-job sitemap
-    // typically lives at /sitemap-jobs.xml or numbered shards.
-    const sitemapRes = await fetch(
-      "https://academicpositions.com/sitemap.xml",
-      { headers: { "User-Agent": USER_AGENT }, signal: AbortSignal.timeout(20_000) },
-    );
-    if (!sitemapRes.ok) {
-      console.log(
-        `[crawl-jobs] sitemap fetch failed: HTTP ${sitemapRes.status}`,
-      );
-      return;
-    }
-    const sitemapXml = await sitemapRes.text();
-    // Pull every <loc> that looks like a job posting.
-    const jobUrls = [...sitemapXml.matchAll(/<loc>([^<]+)<\/loc>/g)]
-      .map((m) => m[1]!)
-      .filter((u) => /\/jobs?\//i.test(u) || /-job-\d+/.test(u))
-      .slice(0, limit);
-
-    if (jobUrls.length === 0) {
-      console.log("[crawl-jobs] no job URLs found in sitemap");
-      return;
-    }
-
-    for (const url of jobUrls) {
-      await new Promise((r) => setTimeout(r, POLITE_DELAY_MS));
-      try {
-        const res = await fetch(url, {
-          headers: { "User-Agent": USER_AGENT },
-          signal: AbortSignal.timeout(15_000),
-        });
-        if (!res.ok) continue;
-        const html = await res.text();
-        const job = parseJobPostingJsonLd(html, url);
-        if (job) yield job;
-      } catch (err) {
-        console.error(
-          `[crawl-jobs] ${url}: ${(err as Error).message.slice(0, 100)}`,
-        );
-      }
-    }
-  },
-};
-
-// Parse a JobPosting schema.org JSON-LD block out of an HTML page.
-// Almost every academic job board publishes one — easier and more
-// stable than parsing visual DOM.
-function parseJobPostingJsonLd(html: string, url: string): CrawledJob | null {
-  // Capture every <script type="application/ld+json"> block; pick the
-  // first one that contains "JobPosting".
-  const blocks = [
-    ...html.matchAll(
-      /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi,
-    ),
-  ].map((m) => m[1]!.trim());
-  for (const raw of blocks) {
-    if (!raw.includes("JobPosting")) continue;
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      continue;
-    }
-    // Some sites wrap in @graph
-    const candidates = Array.isArray(parsed)
-      ? parsed
-      : (parsed as { "@graph"?: unknown[] })["@graph"] ?? [parsed];
-    for (const c of candidates as Array<Record<string, unknown>>) {
-      if (c["@type"] !== "JobPosting") continue;
-      const title = String(c.title ?? "").trim();
-      if (!title) continue;
-      const description = String(c.description ?? "")
-        .replace(/<[^>]+>/g, " ")
-        .replace(/\s+/g, " ")
-        .trim()
-        .slice(0, 5000);
-      const org = c.hiringOrganization as
-        | { name?: string }
-        | undefined;
-      const institution = String(org?.name ?? "").trim() || "Unknown institution";
-      const loc = c.jobLocation as
-        | { address?: { addressCountry?: string; addressLocality?: string } }
-        | undefined;
-      const country = loc?.address?.addressCountry ?? null;
-      const city = loc?.address?.addressLocality ?? null;
-      const deadlineRaw = c.validThrough as string | undefined;
-      const deadline = deadlineRaw ? new Date(deadlineRaw) : null;
-      return {
-        externalId: url,
-        title: title.slice(0, 300),
-        type: classifyJobType(title, description),
-        description,
-        institution: institution.slice(0, 200),
-        country,
-        city,
-        deadline: deadline && !Number.isNaN(deadline.getTime()) ? deadline : null,
-        funded: !!c.baseSalary || /funded|stipend|salary/i.test(description),
-        website: url,
-      };
-    }
-  }
-  return null;
-}
-
-function classifyJobType(
-  title: string,
-  desc: string,
-): CrawledJob["type"] {
-  const t = (title + " " + desc).toLowerCase();
-  if (/\bphd\b|doctoral|graduate student/.test(t)) return "phd";
-  if (/postdoc|post[- ]?doctoral/.test(t)) return "postdoc";
-  if (/fellowship|fellow\b/.test(t)) return "fellowship";
-  if (/grant\b/.test(t)) return "grant";
-  return "job";
-}
-
-// Cheap robots.txt check — only reads the file and looks for a
-// blanket Disallow under our user-agent or *. Not a full parser.
-async function robotsAllowed(origin: string): Promise<boolean> {
+async function fetchPage(url: string): Promise<string> {
   try {
+    const res = await fetch(url, {
+      headers: { "User-Agent": USER_AGENT, Accept: "text/html,*/*" },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      redirect: "follow",
+    });
+    if (!res.ok) {
+      console.log(`[crawl-jobs] ${url}: HTTP ${res.status}`);
+      return "";
+    }
+    const html = await res.text();
+    return html
+      .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/&nbsp;/g, " ")
+      .replace(/&amp;/g, "&")
+      .replace(/&[a-z]+;/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, MAX_TEXT_CHARS);
+  } catch (err) {
+    console.log(`[crawl-jobs] ${url}: ${(err as Error).message.slice(0, 80)}`);
+    return "";
+  }
+}
+
+// Cheap robots.txt check — read the file, look for a Disallow under
+// our UA or *. Not a full parser; conservative reads.
+async function robotsAllowed(originUrl: string): Promise<boolean> {
+  try {
+    const origin = new URL(originUrl).origin;
     const res = await fetch(`${origin}/robots.txt`, {
       headers: { "User-Agent": USER_AGENT },
       signal: AbortSignal.timeout(10_000),
     });
-    if (!res.ok) return true; // missing robots.txt = allowed
+    if (!res.ok) return true;
     const txt = await res.text();
-    // If any block disallows everything under our or * ua, bail.
     const blocks = txt.split(/\n\s*\n/);
     for (const b of blocks) {
       const lines = b.split("\n").map((l) => l.split("#")[0]!.trim());
@@ -215,94 +119,194 @@ async function robotsAllowed(origin: string): Promise<boolean> {
     }
     return true;
   } catch {
-    return true; // network blip = give benefit of the doubt
+    return true;
   }
 }
 
-// ─ Owner profile (singleton) ──────────────────────────────────────
+async function extractJobs(text: string, sourceUrl: string): Promise<CrawledJob[]> {
+  if (!text || text.length < 200) return [];
+  const prompt = `Extract academic job listings from this text. Return JSON array only, no other text.
+
+Source: ${sourceUrl}
+Text: ${text}
+
+Return an array (empty [] if no real positions found). Don't make up jobs that aren't in the text. Maximum 10 jobs per call. Each object:
+{
+  "title": "PhD position in ...",
+  "type": "phd" | "postdoc" | "faculty" | "job" | "fellowship",
+  "institution": "MIT",
+  "department": "Computer Science" | null,
+  "country": "USA" | null,
+  "city": "Cambridge" | null,
+  "description": "brief 1-2 sentence summary",
+  "researchTopics": ["machine learning", "robotics"],
+  "funded": true | false,
+  "deadline": "2026-08-01" | null,
+  "contactEmail": "email@inst.edu" | null,
+  "website": "https://institution.edu/job-page" | null
+}`;
+  try {
+    const res = await anthropic.messages.create({
+      model: MODEL,
+      max_tokens: 1500,
+      messages: [{ role: "user", content: prompt }],
+    });
+    const out = res.content
+      .filter((b): b is Anthropic.TextBlock => b.type === "text")
+      .map((b) => b.text)
+      .join("")
+      .trim();
+    const cleaned = out.replace(/^```(?:json)?|```$/g, "").trim();
+    const parsed = JSON.parse(cleaned);
+    if (!Array.isArray(parsed)) return [];
+    return parsed as CrawledJob[];
+  } catch (err) {
+    console.error(
+      `[crawl-jobs] extractJobs failed: ${(err as Error).message.slice(0, 120)}`,
+    );
+    return [];
+  }
+}
+
 async function getCrawlerProfileId(): Promise<string> {
-  const user = await prisma.researchProfile.upsert({
+  const profile = await prisma.researchProfile.upsert({
     where: { email: CRAWLER_EMAIL },
     create: {
       email: CRAWLER_EMAIL,
-      name: "External Job Crawler",
-      profileType: "recruiter",
+      name: "max-papers crawler",
+      profileType: "system",
       institution: "max-papers (aggregated)",
     },
     update: {},
     select: { id: true },
   });
-  return user.id;
+  return profile.id;
 }
 
-// ─ Main loop ──────────────────────────────────────────────────────
+async function saveJobs(
+  jobs: CrawledJob[],
+  sourceUrl: string,
+  ownerId: string,
+): Promise<{ inserted: number; updated: number }> {
+  let inserted = 0;
+  let updated = 0;
+  for (const job of jobs) {
+    const title = (job.title ?? "").trim();
+    const institution = (job.institution ?? "").trim();
+    if (!title || !institution) continue;
+    if (title.length > 300 || institution.length > 200) continue;
+
+    // Dedup on (institution, title) case-insensitive.
+    const existing = await prisma.position.findFirst({
+      where: {
+        title: { equals: title, mode: "insensitive" },
+        institution: { equals: institution, mode: "insensitive" },
+      },
+      select: { id: true },
+    });
+
+    if (existing) {
+      // Refresh metadata that may have shifted (deadline, funding,
+      // contact). Don't reopen a closed position.
+      await prisma.position.update({
+        where: { id: existing.id },
+        data: {
+          description: (job.description ?? "").slice(0, 5000) || undefined,
+          country: job.country ?? undefined,
+          city: job.city ?? undefined,
+          researchTopics: job.researchTopics ?? undefined,
+          funded: job.funded ?? undefined,
+          deadline: parseDeadline(job.deadline),
+          contactEmail: job.contactEmail ?? undefined,
+          website: job.website ?? undefined,
+          sourceUrl,
+        },
+      });
+      updated++;
+      continue;
+    }
+
+    try {
+      await prisma.position.create({
+        data: {
+          title: title.slice(0, 300),
+          type: normalizeType(job.type),
+          description: (job.description ?? "").slice(0, 5000),
+          institution: institution.slice(0, 200),
+          department: job.department ?? null,
+          country: job.country ?? null,
+          city: job.city ?? null,
+          researchTopics: (job.researchTopics ?? []).slice(0, 20),
+          methods: [],
+          requirements: [],
+          funded: !!job.funded,
+          deadline: parseDeadline(job.deadline),
+          contactEmail: job.contactEmail ?? null,
+          website: job.website ?? null,
+          status: "open",
+          postedById: ownerId,
+          source: "crawled",
+          sourceUrl,
+        },
+      });
+      inserted++;
+    } catch (err) {
+      const msg = (err as Error).message ?? "";
+      if (!msg.includes("Unique constraint")) {
+        console.error(`[crawl-jobs] save error: ${msg.slice(0, 120)}`);
+      }
+    }
+  }
+  return { inserted, updated };
+}
+
+function normalizeType(t: string | undefined): CrawledJob["type"] {
+  const lower = (t ?? "").toLowerCase();
+  if (lower === "phd" || lower === "postdoc" || lower === "faculty" || lower === "fellowship") {
+    return lower;
+  }
+  return "job";
+}
+
+function parseDeadline(s: string | null | undefined): Date | null {
+  if (!s) return null;
+  const d = new Date(s);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
 async function main() {
+  console.log(`[crawl-jobs] starting, ${SOURCES.length} sources`);
   const startedAt = Date.now();
   const ownerId = await getCrawlerProfileId();
-  console.log(`[crawl-jobs] starting; owner profile=${ownerId} cap=${JOB_CAP}`);
+  console.log(`[crawl-jobs] owner profile=${ownerId}`);
 
-  const sources: SourceAdapter[] = [academicPositions];
   let totalInserted = 0;
   let totalUpdated = 0;
 
-  for (const src of sources) {
-    let count = 0;
-    console.log(`[crawl-jobs] source: ${src.name}`);
-    for await (const job of src.crawl(JOB_CAP)) {
-      count++;
-      // Dedup by website URL (set @unique? Not in schema. So we look
-      // up + update or create.)
-      const existing = await prisma.position.findFirst({
-        where: { website: job.externalId },
-        select: { id: true },
-      });
-      if (existing) {
-        await prisma.position.update({
-          where: { id: existing.id },
-          data: {
-            title: job.title,
-            description: job.description,
-            country: job.country,
-            city: job.city,
-            deadline: job.deadline,
-            funded: job.funded,
-            // Don't reopen a closed position automatically; leave
-            // operators in control of status transitions.
-          },
-        });
-        totalUpdated++;
-      } else {
-        await prisma.position.create({
-          data: {
-            title: job.title,
-            type: job.type,
-            description: job.description,
-            institution: job.institution,
-            department: job.department ?? null,
-            country: job.country ?? null,
-            city: job.city ?? null,
-            deadline: job.deadline ?? null,
-            funded: job.funded,
-            contactEmail: job.contactEmail ?? null,
-            website: job.website ?? null,
-            researchTopics: job.researchTopics ?? [],
-            methods: [],
-            requirements: [],
-            postedById: ownerId,
-          },
-        });
-        totalInserted++;
-      }
-      if (count % 10 === 0) {
-        console.log(`[crawl-jobs] ${src.name}: ${count} so far`);
-      }
+  for (const url of SOURCES) {
+    console.log(`\n[crawl-jobs] ${url}`);
+    if (!(await robotsAllowed(url))) {
+      console.log("[crawl-jobs]   robots.txt blocks us — skip");
+      continue;
     }
-    console.log(`[crawl-jobs] ${src.name}: done, ${count} processed`);
+    const text = await fetchPage(url);
+    if (!text) {
+      console.log("[crawl-jobs]   no content — skip");
+      continue;
+    }
+    const jobs = await extractJobs(text, url);
+    console.log(`[crawl-jobs]   extracted ${jobs.length} candidates`);
+    const { inserted, updated } = await saveJobs(jobs, url, ownerId);
+    console.log(`[crawl-jobs]   inserted=${inserted} updated=${updated}`);
+    totalInserted += inserted;
+    totalUpdated += updated;
+    await new Promise((r) => setTimeout(r, POLITE_DELAY_MS));
   }
 
-  const secs = ((Date.now() - startedAt) / 1000).toFixed(1);
+  const total = await prisma.position.count();
+  const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
   console.log(
-    `[crawl-jobs] DONE inserted=${totalInserted} updated=${totalUpdated} elapsed=${secs}s`,
+    `\n[crawl-jobs] DONE inserted=${totalInserted} updated=${totalUpdated} totalPositions=${total} elapsed=${elapsed}s`,
   );
   await prisma.$disconnect();
 }

@@ -586,9 +586,30 @@ function TalentRail({
         Talent · {topic ?? "—"}
       </div>
 
-      <h3 style={railSectionLabel}>
-        {talent ? `${talent.positions.length} matching positions` : "Open positions"}
-      </h3>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          marginBottom: 10,
+        }}
+      >
+        <h3 style={{ ...railSectionLabel, marginBottom: 0 }}>
+          {talent ? `${talent.positions.length} matching positions` : "Open positions"}
+        </h3>
+        <a
+          href="/talent?tab=post"
+          style={{
+            fontSize: 11,
+            padding: "4px 10px",
+            background: "#111",
+            color: "#fff",
+            textDecoration: "none",
+          }}
+        >
+          + Post a job
+        </a>
+      </div>
       {loading && !talent ? (
         <p style={railPlaceholder}>Loading positions…</p>
       ) : !talent || talent.positions.length === 0 ? (
@@ -603,9 +624,32 @@ function TalentRail({
         </ul>
       )}
 
-      <h3 style={{ ...railSectionLabel, marginTop: 22 }}>
-        Candidates — openly looking
-      </h3>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          marginBottom: 10,
+          marginTop: 22,
+        }}
+      >
+        <h3 style={{ ...railSectionLabel, marginBottom: 0 }}>
+          Candidates — openly looking
+        </h3>
+        <a
+          href="/talent/status"
+          style={{
+            fontSize: 11,
+            padding: "4px 10px",
+            background: "transparent",
+            color: "#666",
+            border: "0.5px solid #e8e0c8",
+            textDecoration: "none",
+          }}
+        >
+          Set my status
+        </a>
+      </div>
       {loading && !talent ? (
         <p style={railPlaceholder}>Loading candidates…</p>
       ) : !talent || talent.candidates.length === 0 ? (
@@ -690,14 +734,12 @@ function TalentRail({
 }
 
 function PositionCard({ p }: { p: MatchPosition }) {
+  const [applying, setApplying] = useState(false);
   const scoreColor = p.score >= 80 ? "#27500a" : "#854f0b";
   const barColor = p.score >= 80 ? "#3b6d11" : "#854f0b";
   return (
-    <a
-      href={`/talent/positions/${p.id}`}
+    <div
       style={{
-        display: "block",
-        textDecoration: "none",
         border: "0.5px solid #e8e0c8",
         padding: "10px 12px",
         color: "inherit",
@@ -712,9 +754,19 @@ function PositionCard({ p }: { p: MatchPosition }) {
         }}
       >
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontSize: 12, fontWeight: 500, color: "#111", lineHeight: 1.3 }}>
+          <a
+            href={`/talent/positions/${p.id}`}
+            style={{
+              fontSize: 12,
+              fontWeight: 500,
+              color: "#111",
+              lineHeight: 1.3,
+              textDecoration: "none",
+              display: "block",
+            }}
+          >
             {p.title}
-          </div>
+          </a>
           <div style={{ fontSize: 11, color: "#666", marginTop: 2 }}>
             {(p.postedBy?.institution ?? p.postedBy?.name) ?? "—"}
             {p.country ? ` · ${p.country}` : ""}
@@ -733,7 +785,14 @@ function PositionCard({ p }: { p: MatchPosition }) {
       >
         <div style={{ width: `${p.score}%`, height: "100%", background: barColor }} />
       </div>
-      <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+      <div
+        style={{
+          display: "flex",
+          gap: 4,
+          flexWrap: "wrap",
+          alignItems: "center",
+        }}
+      >
         {p.funded ? (
           <span
             style={{
@@ -765,10 +824,145 @@ function PositionCard({ p }: { p: MatchPosition }) {
             })}
           </span>
         ) : null}
+        <button
+          type="button"
+          onClick={() => setApplying((v) => !v)}
+          style={{
+            marginLeft: "auto",
+            fontSize: 10,
+            padding: "3px 10px",
+            background: applying ? "transparent" : "#111",
+            color: applying ? "#666" : "#fff",
+            border: applying ? "0.5px solid #e8e0c8" : "0.5px solid #111",
+            cursor: "pointer",
+          }}
+        >
+          {applying ? "Close" : "Apply privately"}
+        </button>
       </div>
-    </a>
+      {applying ? <QuickApplyForm positionId={p.id} /> : null}
+    </div>
   );
 }
+
+// Compact in-rail application form. POSTs /api/talent/apply.
+function QuickApplyForm({ positionId }: { positionId: string }) {
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+  const [message, setMessage] = useState("");
+  const [status, setStatus] = useState<"idle" | "sending" | "ok" | "dup" | "error">(
+    "idle",
+  );
+  const [error, setError] = useState<string | null>(null);
+
+  async function submit() {
+    if (!name.trim() || !email.includes("@")) {
+      setError("Name + email required");
+      return;
+    }
+    setStatus("sending");
+    setError(null);
+    try {
+      const res = await fetch("/api/talent/apply", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ positionId, name, email, message }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setStatus("error");
+        setError(data.error ?? "Apply failed");
+        return;
+      }
+      setStatus(data.status === "already_applied" ? "dup" : "ok");
+    } catch (err) {
+      setStatus("error");
+      setError((err as Error).message ?? "Network error");
+    }
+  }
+
+  if (status === "ok" || status === "dup") {
+    return (
+      <div
+        style={{
+          marginTop: 8,
+          padding: "8px 10px",
+          background: "#f3faea",
+          border: "0.5px solid #b8d9a0",
+          fontSize: 11,
+          color: "#27500a",
+        }}
+      >
+        {status === "ok"
+          ? "✓ Application submitted privately. The employer will be in touch."
+          : "You've already applied to this position."}
+      </div>
+    );
+  }
+
+  return (
+    <div
+      style={{
+        marginTop: 8,
+        padding: 10,
+        background: "#faf8f5",
+        display: "flex",
+        flexDirection: "column",
+        gap: 6,
+      }}
+    >
+      <input
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+        placeholder="Your name"
+        style={miniInput}
+      />
+      <input
+        value={email}
+        onChange={(e) => setEmail(e.target.value)}
+        placeholder="Email"
+        type="email"
+        style={miniInput}
+      />
+      <textarea
+        value={message}
+        onChange={(e) => setMessage(e.target.value)}
+        placeholder="Optional message"
+        rows={2}
+        style={{ ...miniInput, fontFamily: "inherit", resize: "vertical" }}
+      />
+      {error ? (
+        <p style={{ fontSize: 10, color: "#c0392b", margin: 0 }}>{error}</p>
+      ) : null}
+      <button
+        type="button"
+        onClick={submit}
+        disabled={status === "sending"}
+        style={{
+          fontSize: 11,
+          padding: "5px 12px",
+          background: "#111",
+          color: "#fff",
+          border: "none",
+          cursor: status === "sending" ? "wait" : "pointer",
+          alignSelf: "flex-start",
+        }}
+      >
+        {status === "sending" ? "Sending…" : "Submit"}
+      </button>
+    </div>
+  );
+}
+
+const miniInput: React.CSSProperties = {
+  width: "100%",
+  padding: "6px 8px",
+  fontSize: 11,
+  border: "0.5px solid #e8e0c8",
+  outline: "none",
+  boxSizing: "border-box",
+  background: "#fff",
+};
 
 function CandidateCard({ c }: { c: MatchCandidate }) {
   const initials = c.name

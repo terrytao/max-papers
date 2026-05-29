@@ -50,14 +50,16 @@ model Paper {
 
 model Researcher {
   id          String   @id @default(cuid())
-  name        String
+  // Unique on name so the extraction agent can bulk-upsert without
+  // race-creating duplicate rows for the same author across batches.
+  // Table is empty before the constraint is added, so the migration
+  // is safe (no pre-existing dups to collide).
+  name        String   @unique
   institution String?
   email       String?
   website     String?
   paperCount  Int      @default(0)
   createdAt   DateTime @default(now())
-
-  @@index([name])
 }
 
 // ──────────────────────────────────────────────────────────────────

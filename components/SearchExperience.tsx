@@ -12,7 +12,7 @@
 // the common case is fine. AbortController-based race-proofing is
 // a follow-up if it bites.
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 interface FilterSuggestions {
   topics?: string[];
@@ -102,6 +102,9 @@ const SUGGESTIONS = [
   "Geoffrey Hinton neural network papers",
 ];
 
+// Delay (ms) between the last filter keystroke and firing the search.
+const SEARCH_DEBOUNCE_MS = 1000;
+
 export function SearchExperience() {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SearchResult | null>(null);
@@ -116,6 +119,11 @@ export function SearchExperience() {
   // talent) — both keyed off the same search; when a new search
   // fires, any in-flight tail responses are dropped.
   const summaryTokenRef = useRef(0);
+  const searchDebounce = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => { if (searchDebounce.current) clearTimeout(searchDebounce.current); },
+    [],
+  );
 
   async function search(
     overrideFilters?: Filters,
@@ -234,10 +242,19 @@ export function SearchExperience() {
     }
   }
 
-  function updateFilter<K extends keyof Filters>(key: K, value: Filters[K]) {
+  function updateFilter<K extends keyof Filters>(
+    key: K,
+    value: Filters[K],
+    opts?: { immediate?: boolean },
+  ) {
     const updated: Filters = { ...(activeFilters ?? {}), [key]: value };
-    setActiveFilters(updated);
-    search(updated);
+    setActiveFilters(updated); // keep the input responsive
+    if (searchDebounce.current) clearTimeout(searchDebounce.current);
+    if (opts?.immediate) {
+      search(updated);
+    } else {
+      searchDebounce.current = setTimeout(() => search(updated), SEARCH_DEBOUNCE_MS);
+    }
   }
 
   function pickMatchMode(mode: "AND" | "OR") {
@@ -380,7 +397,7 @@ export function SearchExperience() {
               value={activeFilters?.topic ?? ""}
               onChange={(v) => updateFilter("topic", v || null)}
               suggestions={activeFilters?.suggestions?.topics ?? []}
-              onPick={(s) => updateFilter("topic", s)}
+              onPick={(s) => updateFilter("topic", s, { immediate: true })}
             />
 
             <FilterField
@@ -389,7 +406,7 @@ export function SearchExperience() {
               value={activeFilters?.author ?? ""}
               onChange={(v) => updateFilter("author", v || null)}
               suggestions={activeFilters?.suggestions?.authors ?? []}
-              onPick={(s) => updateFilter("author", s)}
+              onPick={(s) => updateFilter("author", s, { immediate: true })}
             />
 
             <div style={{ marginBottom: 14 }}>
@@ -437,7 +454,7 @@ export function SearchExperience() {
               value={activeFilters?.journal ?? ""}
               onChange={(v) => updateFilter("journal", v || null)}
               suggestions={activeFilters?.suggestions?.journals ?? []}
-              onPick={(s) => updateFilter("journal", s)}
+              onPick={(s) => updateFilter("journal", s, { immediate: true })}
             />
 
             <div style={{ marginBottom: 14 }}>
@@ -456,7 +473,7 @@ export function SearchExperience() {
                   type="checkbox"
                   checked={activeFilters?.openAccess === true}
                   onChange={(e) =>
-                    updateFilter("openAccess", e.target.checked ? true : null)
+                    updateFilter("openAccess", e.target.checked ? true : null, { immediate: true })
                   }
                 />
                 Open access only

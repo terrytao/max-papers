@@ -31,6 +31,7 @@
 //    matching everything.
 
 import { prisma } from "@/lib/prisma";
+import { sendMatchNotification } from "@/lib/notifications/email";
 
 // Words that, if a title leads with them, get stripped before we
 // search abstracts for the title — otherwise generic phrasing
@@ -300,5 +301,68 @@ export async function matchPosition(positionId: string): Promise<ScoredMatch[]> 
     });
   }
 
+  // Fire notification emails for new matches (notified = false).
+  // We only email NEW matches — re-runs of matchPosition refresh the
+  // score on existing rows but don't re-notify, to avoid spamming
+  // candidates every time the engine retunes.
+  void notifyNewMatches(top.map((m) => ({ positionId: m.positionId, profileId: m.profileId })));
+
   return top;
+}
+
+// Fire-and-forget notification dispatch. Looks up which Match rows
+// haven't been notified yet, sends emails, then flips notified=true.
+// Failures are logged but don't propagate — never break matching on a
+// downstream email blip.
+async function notifyNewMatches(
+  matches: Array<{ positionId: string; profileId: string }>,
+): Promise<void> {
+  if (matches.length === 0) return;
+  try {
+    const rows = await prisma.match.findMany({
+      where: {
+        OR: matches,
+        notified: false,
+      },
+      include: {
+        position: {
+          select: {
+            id: true,
+            title: true,
+            institution: true,
+            postedBy: { select: { name: true, email: true } },
+          },
+        },
+        profile: { select: { id: true, name: true, email: true } },
+      },
+    });
+    for (const m of rows) {
+      try {
+        await sendMatchNotification({
+          candidate: { name: m.profile.name, email: m.profile.email },
+          pi: { name: m.position.postedBy.name, email: m.position.postedBy.email },
+          positionTitle: m.position.title,
+          positionInstitution: m.position.institution,
+          positionId: m.position.id,
+          candidateId: m.profile.id,
+          score: m.score,
+          reasons: m.reasons,
+        });
+        await prisma.match.update({
+          where: { id: m.id },
+          data: { notified: true },
+        });
+      } catch (err) {
+        console.error(
+          `[matching] notification failed for match ${m.id}:`,
+          (err as Error).message,
+        );
+      }
+    }
+  } catch (err) {
+    console.error(
+      `[matching] notifyNewMatches batch failed:`,
+      (err as Error).message,
+    );
+  }
 }

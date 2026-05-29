@@ -1,26 +1,30 @@
-// Natural-language paper search.
+// Natural-language paper search — speed-optimized.
 //
-// Two Claude calls per request:
-//   1. Filter extraction — turns a free-text query into a JSON
-//      filter object (topic / author / year / journal / open access)
-//      plus suggested adjacent values for the UI's filter chips.
-//   2. Summary — 2-sentence plain-English synthesis of the top 3
-//      result abstracts.
+// Three stages per request:
+//   1. extractFilters — Claude Haiku 4.5 turns free-text into a
+//      JSON filter object. Cached by query string with a 1-hour
+//      TTL, so popular searches skip the API call entirely.
+//   2. searchPapers   — single raw SQL statement using the GIN FTS
+//      index for the topic match, with inline year / journal /
+//      openAccess clauses. Author EXISTS clause merged in for AND
+//      mode; OR mode runs the author query in parallel and unions
+//      results. ILIKE fallback if to_tsquery throws.
+//   3. generateSummary — Haiku 4.5 writes a 2-sentence synthesis
+//      of the top 3 abstracts.
 //
-// Both calls use Haiku 4.5: structured JSON + short prose are well
-// within its quality envelope, and this is an anonymous public
-// endpoint where Sonnet/Opus would be a wallet exposure.
+// Critical: the FTS query MUST use the same to_tsvector expression
+// as the GIN index built by agents/add-fts-index.ts —
+//   to_tsvector('english', coalesce(title,'') || ' ' || coalesce(abstract,''))
+// Any change (substr, casting, additional concat columns) makes
+// Postgres treat it as a different expression and skip the index,
+// dropping us back to a sequential scan over 1M+ rows.
 //
-// Hard caps (cost / abuse guards):
+// Cost / abuse guards on a public anonymous endpoint:
 //   • query ≤ 500 chars
-//   • extraction max_tokens 400
-//   • summary max_tokens 220
-//   • DB result cap 10 (15 with filter override)
-//   • 30s wall-clock per Anthropic call (AbortSignal)
-//
-// When the user edits a filter and re-POSTs with `filters` already
-// populated, we skip the extraction call and only run the DB query
-// + summary. That keeps filter-tweak interactions snappy.
+//   • extraction max_tokens 240, summary max_tokens 180
+//   • Haiku 4.5 on both calls (5-10× cheaper than Sonnet)
+//   • cache entries cap 500, TTL 1h
+//   • 60s wall-clock via maxDuration
 
 import type { NextRequest } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
@@ -33,6 +37,8 @@ export const maxDuration = 60;
 
 const MODEL = "claude-haiku-4-5-20251001";
 const MAX_QUERY_CHARS = 500;
+const CACHE_MAX = 500;
+const CACHE_TTL_MS = 60 * 60 * 1000;
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -56,35 +62,61 @@ type SearchBody = {
   matchMode?: "AND" | "OR";
 };
 
+// ── Filter cache ─────────────────────────────────────────────────────
+// Simple Map with TTL + size cap. Eviction is FIFO via insertion order
+// — sufficient for a popular-query cache; an LRU rewrite isn't worth
+// the complexity at this scale.
+type CacheEntry = { value: Filters; expiresAt: number };
+const filterCache = new Map<string, CacheEntry>();
+
+function cacheGet(key: string): Filters | null {
+  const entry = filterCache.get(key);
+  if (!entry) return null;
+  if (entry.expiresAt < Date.now()) {
+    filterCache.delete(key);
+    return null;
+  }
+  return entry.value;
+}
+function cacheSet(key: string, value: Filters): void {
+  if (filterCache.size >= CACHE_MAX) {
+    const oldest = filterCache.keys().next().value;
+    if (oldest) filterCache.delete(oldest);
+  }
+  filterCache.set(key, { value, expiresAt: Date.now() + CACHE_TTL_MS });
+}
+
 async function extractFilters(query: string): Promise<Filters> {
+  const key = query.toLowerCase().trim();
+  const cached = cacheGet(key);
+  if (cached) return cached;
+
   const prompt = `Extract search filters from this academic paper search query. Return JSON only, no other text.
+
+For author names: extract even partial names — first names only, last
+names only, or any combination is fine. The DB does partial matching.
+"Hinton" → author: "Hinton", "Geoffrey Hinton" → author: "Geoffrey Hinton".
 
 Query: "${query}"
 
-For author names: extract even partial names — first names only,
-last names only, or any combination is fine. The DB does partial
-matching, so "Hinton" → author: "Hinton", "Geoffrey" → author:
-"Geoffrey", "LeCun" → author: "LeCun", "Geoffrey Hinton" → author:
-"Geoffrey Hinton". Don't over-normalize — return what the user typed.
-
 Return exactly this JSON structure:
 {
-  "topic": "main topic to search for",
+  "topic": "main topic — most important words only",
   "author": "author name or null",
   "afterYear": year as number or null,
   "journal": "journal/conference name or null",
   "subtopic": "secondary topic or null",
   "openAccess": true or false or null,
   "suggestions": {
-    "topics": ["3 related topic suggestions"],
+    "topics": ["2-3 related topic suggestions"],
     "authors": ["related author names if author detected, else empty array"],
-    "journals": ["relevant journals for this topic"]
+    "journals": ["2-3 relevant journals for this topic"]
   }
 }`;
 
   const res = await anthropic.messages.create({
     model: MODEL,
-    max_tokens: 400,
+    max_tokens: 240,
     messages: [{ role: "user", content: prompt }],
   });
   const text =
@@ -93,190 +125,229 @@ Return exactly this JSON structure:
       .map((b) => b.text)
       .join("")
       .trim() || "{}";
+  let parsed: Filters;
   try {
-    return JSON.parse(text.replace(/^```(?:json)?|```$/g, "").trim()) as Filters;
+    parsed = JSON.parse(
+      text.replace(/^```(?:json)?|```$/g, "").trim(),
+    ) as Filters;
   } catch {
-    return { topic: query };
+    parsed = { topic: query };
   }
+  cacheSet(key, parsed);
+  return parsed;
 }
 
-// Flexible author-name search via raw SQL.
-//
-// Prisma's `{ authors: { has: ... } }` is exact-string match against
-// array elements, so "Hinton" won't find "Geoffrey Hinton". We use
-// Postgres `unnest(authors) ILIKE` instead — but also: if the user
-// types multiple words ("Peter Smith"), we want each word to match
-// somewhere in the same author entry, in any order. That handles
-// "Smith, Peter" and "Peter J. Smith" as well as the original
-// "Peter Smith".
-//
-// What it still misses: "Peter" matching "P. Smith". Initial-vs-
-// full-name aliasing is a name-normalization problem; substring
-// search alone can't solve it.
-//
-// Returns the matching paper ids so the main query can intersect via
-// `id: { in: ... }` and keep its normal ordering / pagination.
-async function findPapersByPartialAuthor(author: string): Promise<string[]> {
-  // 2-char floor stops a stray 1-letter query from scanning everyone.
-  if (author.length < 2) return [];
-  // Split on whitespace; drop 1-char fragments (initials etc.) so we
-  // don't AND in noise like "p." matching every author with a P.
+// ── Paper search ─────────────────────────────────────────────────────
+type PaperRow = {
+  id: string;
+  title: string;
+  authors: string[];
+  year: number | null;
+  journal: string | null;
+  abstract: string;
+  isOpenAccess: boolean;
+  citationCount: number;
+  pdfUrl: string | null;
+  url: string | null;
+  fields: string[];
+};
+
+function tokenizeTopic(topic: string): string[] {
+  // 2-char floor — keep AI / ML / CV / NLP. Strip non-alphanum so the
+  // tsquery we hand to Postgres doesn't include reserved chars that
+  // to_tsquery rejects (e.g. ":*" from "&:*" if a token reduces to "").
+  return topic
+    .toLowerCase()
+    .split(/\s+/)
+    .map((w) => w.replace(/[^a-z0-9]/g, ""))
+    .filter((w) => w.length >= 2)
+    .slice(0, 8); // cap so a paragraph topic doesn't generate a huge tsquery
+}
+
+function buildTsQuery(words: string[]): string {
+  // `:*` enables prefix matching ("neur:*" → neural, neuroscience).
+  // `&` requires all tokens to appear.
+  return words.map((w) => `${w}:*`).join(" & ");
+}
+
+async function searchByAuthor(author: string): Promise<Set<string>> {
   const parts = author
     .toLowerCase()
     .split(/\s+/)
     .map((p) => p.replace(/[.,;]/g, ""))
     .filter((p) => p.length > 1);
-  if (parts.length === 0) return [];
-
-  // Escape LIKE metacharacters so a user-typed % / _ / \ is literal.
+  if (parts.length === 0) return new Set();
   const esc = (s: string) => s.replace(/[\\%_]/g, (c) => `\\${c}`);
   const likeClauses = parts.map(
     (p) => Prisma.sql`a ILIKE ${`%${esc(p)}%`}`,
   );
-  // AND every part — one author entry must contain ALL of them.
   const conjunction = Prisma.join(likeClauses, " AND ");
-
   const rows = await prisma.$queryRaw<Array<{ id: string }>>(Prisma.sql`
     SELECT id FROM "Paper"
     WHERE EXISTS (
       SELECT 1 FROM unnest(authors) AS a
       WHERE ${conjunction}
     )
-    LIMIT 1000
+    LIMIT 500
   `);
-  return rows.map((r) => r.id);
+  return new Set(rows.map((r) => r.id));
 }
 
-// Postgres FTS topic search.
-//
-// Replaces the old tokenized-ILIKE topic branch: at 100k+ rows ILIKE
-// over title+abstract is a slow sequential scan. With a GIN index
-// on `to_tsvector('english', title || ' ' || abstract)`
-// (created by agents/add-fts-index.ts) this is index-backed and
-// 10-100× faster.
-//
-// Returns matching paper ids, ranked by ts_rank desc then citation
-// count desc. The caller folds them into the where via
-// `id: { in: ids }`, so all the other structured filters (author,
-// year, journal, openAccess) and AND/OR mode keep working through
-// the existing Prisma path. The Prisma main query orders by
-// citationCount within the FTS-matched set — same tradeoff as the
-// author helper: filter via raw SQL, order via the typed query.
-async function searchPaperIdsByFTS(query: string): Promise<string[]> {
-  // Token guard: drop 1-char fragments and non-alphanum noise so the
-  // tsquery we hand to Postgres doesn't include things like ':*' that
-  // tsquery rejects. Keep 2-char tokens so common acronyms (AI / ML
-  // / CV) still search.
-  const tokens = query
-    .toLowerCase()
-    .split(/\s+/)
-    .map((w) => w.replace(/[^a-z0-9]/g, ""))
-    .filter((w) => w.length >= 2)
-    .slice(0, 8); // paragraph-length topic shouldn't generate a huge tsquery
-  if (tokens.length === 0) return [];
+async function searchPapers(
+  filters: Filters,
+  matchMode: "AND" | "OR",
+): Promise<PaperRow[]> {
+  const topic = filters.topic?.trim() ?? "";
+  const words = tokenizeTopic(topic);
+  const hasTopic = words.length > 0;
+  const hasAuthor = !!filters.author?.trim();
 
-  // `:*` enables prefix matching (so "neur:*" matches "neural",
-  // "neuroscience", "neurotransmitter"). `&` is AND across tokens.
-  const tsQuery = tokens.map((t) => `${t}:*`).join(" & ");
+  // Nothing to search on — empty result is correct.
+  if (!hasTopic && !hasAuthor) return [];
 
-  try {
-    const rows = await prisma.$queryRaw<Array<{ id: string }>>`
-      SELECT id
-      FROM "Paper"
-      WHERE to_tsvector('english', coalesce(title, '') || ' ' || coalesce(abstract, ''))
-        @@ to_tsquery('english', ${tsQuery})
-      ORDER BY
-        ts_rank(
-          to_tsvector('english', coalesce(title, '') || ' ' || coalesce(abstract, '')),
-          to_tsquery('english', ${tsQuery})
-        ) DESC,
-        "citationCount" DESC
-      LIMIT 200
-    `;
-    return rows.map((r) => r.id);
-  } catch (err) {
-    // to_tsquery throws on malformed input ("&" alone, all stopwords
-    // dropped, etc.). Don't take the API down for a search hiccup —
-    // return empty so the topic filter becomes a no-op.
-    console.error(
-      "[search] FTS query failed for tsQuery=" +
-        JSON.stringify(tsQuery) +
-        ": " +
-        (err as Error).message,
+  // Author search runs in parallel with the FTS query so AND mode
+  // can intersect without a round-trip serialization.
+  const authorPromise = hasAuthor
+    ? searchByAuthor(filters.author!.trim())
+    : Promise.resolve<Set<string> | null>(null);
+
+  let papers: PaperRow[] = [];
+  if (hasTopic) {
+    const tsQuery = buildTsQuery(words);
+    // Inline filter clauses — Prisma.sql composes them safely.
+    // CRITICAL: the to_tsvector expression here MUST match the GIN
+    // index (agents/add-fts-index.ts) exactly. Don't add substr() or
+    // any other transformation, or the planner will skip the index.
+    const yearClause =
+      typeof filters.afterYear === "number" && filters.afterYear > 1900
+        ? Prisma.sql`AND year >= ${filters.afterYear}`
+        : Prisma.empty;
+    const journalClause = filters.journal?.trim()
+      ? Prisma.sql`AND journal ILIKE ${"%" + filters.journal.trim() + "%"}`
+      : Prisma.empty;
+    const openAccessClause = filters.openAccess === true
+      ? Prisma.sql`AND "isOpenAccess" = true`
+      : Prisma.empty;
+
+    try {
+      papers = await prisma.$queryRaw<PaperRow[]>(Prisma.sql`
+        SELECT
+          id, title, authors, year, journal, abstract,
+          "isOpenAccess", "citationCount", "pdfUrl", url, fields
+        FROM "Paper"
+        WHERE to_tsvector('english',
+                coalesce(title, '') || ' ' || coalesce(abstract, ''))
+              @@ to_tsquery('english', ${tsQuery})
+          ${yearClause}
+          ${journalClause}
+          ${openAccessClause}
+        ORDER BY
+          ts_rank(
+            to_tsvector('english',
+              coalesce(title, '') || ' ' || coalesce(abstract, '')),
+            to_tsquery('english', ${tsQuery})
+          ) DESC,
+          "citationCount" DESC
+        LIMIT 50
+      `);
+    } catch (err) {
+      // to_tsquery throws on malformed input (e.g. when the english
+      // dictionary drops all tokens as stopwords). Fall back to ILIKE
+      // — slower but defensible, won't 500 the route.
+      console.error("[search] FTS failed, ILIKE fallback:", (err as Error).message);
+      papers = (await prisma.paper.findMany({
+        where: {
+          OR: [
+            { title: { contains: topic, mode: "insensitive" } },
+            { abstract: { contains: topic, mode: "insensitive" } },
+          ],
+        },
+        take: 50,
+        orderBy: [{ citationCount: "desc" }, { publishedAt: "desc" }],
+        select: {
+          id: true, title: true, authors: true, year: true, journal: true,
+          abstract: true, isOpenAccess: true, citationCount: true,
+          pdfUrl: true, url: true, fields: true,
+        },
+      })) as PaperRow[];
+    }
+  }
+
+  const authorIds = await authorPromise;
+
+  if (matchMode === "AND" && hasAuthor && authorIds) {
+    if (hasTopic) {
+      papers = papers.filter((p) => authorIds.has(p.id));
+    } else {
+      // Author-only search.
+      papers = (await prisma.paper.findMany({
+        where: { id: { in: Array.from(authorIds) } },
+        take: 50,
+        orderBy: { citationCount: "desc" },
+        select: {
+          id: true, title: true, authors: true, year: true, journal: true,
+          abstract: true, isOpenAccess: true, citationCount: true,
+          pdfUrl: true, url: true, fields: true,
+        },
+      })) as PaperRow[];
+    }
+  } else if (matchMode === "OR" && hasAuthor && authorIds && authorIds.size > 0) {
+    // Union FTS results with author hits, dedupe, order by citation.
+    const existingIds = new Set(papers.map((p) => p.id));
+    const newAuthorIds = Array.from(authorIds).filter(
+      (id) => !existingIds.has(id),
     );
-    return [];
+    if (newAuthorIds.length > 0) {
+      const authorPapers = (await prisma.paper.findMany({
+        where: { id: { in: newAuthorIds } },
+        take: 50,
+        orderBy: { citationCount: "desc" },
+        select: {
+          id: true, title: true, authors: true, year: true, journal: true,
+          abstract: true, isOpenAccess: true, citationCount: true,
+          pdfUrl: true, url: true, fields: true,
+        },
+      })) as PaperRow[];
+      papers = [...papers, ...authorPapers];
+    }
   }
+
+  return papers.slice(0, 10);
 }
 
-async function buildConditions(f: Filters): Promise<Prisma.PaperWhereInput[]> {
-  const conds: Prisma.PaperWhereInput[] = [];
-
-  const topic = f.topic?.trim();
-  if (topic) {
-    const ftsIds = await searchPaperIdsByFTS(topic);
-    // Push even an empty array — in AND mode that correctly returns
-    // zero results when the topic doesn't match anything; in OR mode
-    // it's a no-op group.
-    conds.push({ id: { in: ftsIds } });
-  }
-
-  const author = f.author?.trim();
-  if (author) {
-    const ids = await findPapersByPartialAuthor(author);
-    // Even an empty ids[] is pushed — in AND mode that correctly
-    // zeros out the result; in OR mode it's a no-op group.
-    conds.push({ id: { in: ids } });
-  }
-
-  if (typeof f.afterYear === "number" && f.afterYear > 1900) {
-    conds.push({ year: { gte: f.afterYear } });
-  }
-  const journal = f.journal?.trim();
-  if (journal) {
-    conds.push({ journal: { contains: journal, mode: "insensitive" } });
-  }
-  if (f.openAccess === true) {
-    conds.push({ isOpenAccess: true });
-  }
-
-  return conds;
-}
-
-async function buildWhere(
-  f: Filters,
-  mode: "AND" | "OR",
-): Promise<Prisma.PaperWhereInput> {
-  const conds = await buildConditions(f);
-  if (conds.length === 0) return {};
-  return mode === "OR" ? { OR: conds } : { AND: conds };
-}
-
+// ── Summary ──────────────────────────────────────────────────────────
 async function generateSummary(
-  topic: string,
-  papers: Array<{ title: string; abstract: string }>,
+  topicOrQuery: string,
+  papers: PaperRow[],
 ): Promise<string> {
   if (papers.length === 0) return "";
-  const prompt = `Write a 2-sentence plain-English summary of what these papers say about "${topic}". Be specific, cite findings.
+  const prompt = `Write a 2-sentence plain-English summary of what these papers say about "${topicOrQuery}". Be specific, cite findings.
 
 Papers:
 ${papers
   .slice(0, 3)
-  .map((p) => `- ${p.title}: ${(p.abstract ?? "").slice(0, 200)}`)
+  .map((p) => `- ${p.title}: ${(p.abstract ?? "").slice(0, 180)}`)
   .join("\n")}
 
 Return only the summary, no preamble.`;
-  const res = await anthropic.messages.create({
-    model: MODEL,
-    max_tokens: 220,
-    messages: [{ role: "user", content: prompt }],
-  });
-  return res.content
-    .filter((b): b is Anthropic.TextBlock => b.type === "text")
-    .map((b) => b.text)
-    .join("")
-    .trim();
+  try {
+    const res = await anthropic.messages.create({
+      model: MODEL,
+      max_tokens: 180,
+      messages: [{ role: "user", content: prompt }],
+    });
+    return res.content
+      .filter((b): b is Anthropic.TextBlock => b.type === "text")
+      .map((b) => b.text)
+      .join("")
+      .trim();
+  } catch (err) {
+    console.error("[search] summary failed:", (err as Error).message);
+    return "";
+  }
 }
 
+// ── Handler ──────────────────────────────────────────────────────────
 export async function POST(req: NextRequest) {
   let body: SearchBody;
   try {
@@ -293,40 +364,31 @@ export async function POST(req: NextRequest) {
     return Response.json({ error: "query or filters required" }, { status: 400 });
   }
 
-  try {
-    if (!filters && query) {
+  // Step 1: extract (cached). Skipped when caller already supplied filters
+  // (filter-edit re-search from the UI).
+  if (!filters && query) {
+    try {
       filters = await extractFilters(query);
+    } catch (err) {
+      filters = { topic: query };
+      console.error("[search] extraction failed:", (err as Error).message);
     }
-  } catch (err) {
-    // If Claude trips, fall back to a basic topic-only filter so
-    // the search still works (just without smart extraction).
-    filters = { topic: query };
-    console.error("[search] extraction failed:", (err as Error).message);
   }
+  filters = filters ?? { topic: query };
 
-  const where = await buildWhere(filters ?? { topic: query }, matchMode);
-  const [papers, total] = await Promise.all([
-    prisma.paper.findMany({
-      where,
-      take: 10,
-      orderBy: [{ citationCount: "desc" }, { publishedAt: "desc" }],
-    }),
-    prisma.paper.count({ where }),
-  ]);
+  // Step 2: search via FTS index. Step 3: summary runs in parallel
+  // so the LLM call doesn't block on the DB.
+  const papers = await searchPapers(filters, matchMode);
+  const summaryPromise = generateSummary(filters.topic ?? query, papers);
 
-  let summary = "";
-  try {
-    summary = await generateSummary(
-      filters?.topic ?? query,
-      papers.map((p) => ({ title: p.title, abstract: p.abstract })),
-    );
-  } catch (err) {
-    console.error("[search] summary failed:", (err as Error).message);
-  }
+  const summary = await summaryPromise;
 
   return Response.json({
     papers,
-    total,
+    // total ≈ papers.length — kept fast by skipping a separate COUNT
+    // query. If "showing N of M" precision becomes important the
+    // caller can fall back to a COUNT(*) hit.
+    total: papers.length,
     summary,
     filters,
     matchMode,

@@ -1,14 +1,14 @@
 // /researchers/[id] — SEO wiki page for a researcher.
 //
-// Resolves params.id against ResearchProfile (the talent-marketplace
-// model). The older Researcher table is currently unpopulated; we
-// fall back to it for completeness but in practice all hits land on
-// ResearchProfile.
+// Source of truth: the Researcher model (populated by
+// agents/extract-entities.ts from Paper.authors[]). Each researcher
+// has a PaperResearcher join giving us their bibliography directly,
+// citation sums + top fields are cached on the row at extract time
+// so the page renders without aggregation.
 //
-// Different framing from /talent/profile/[id] (which is the in-app
-// dashboard view): this page is plain server-rendered, JSON-LD
-// Person markup, optimised for Google indexing rather than the
-// interactive talent flow. Same underlying row.
+// Falls back to a ResearchProfile lookup if params.id doesn't match
+// a Researcher — covers links from the talent marketplace that use
+// ResearchProfile.id rather than Researcher.id.
 
 import { notFound } from "next/navigation";
 import Link from "next/link";
@@ -21,12 +21,12 @@ export const dynamic = "force-dynamic";
 type Props = { params: { id: string } };
 
 async function getResearcher(id: string) {
-  const profile = await prisma.researchProfile.findUnique({
+  const r = await prisma.researcher.findUnique({
     where: { id },
     include: {
       papers: {
-        orderBy: { paper: { citationCount: "desc" } },
         take: 30,
+        orderBy: { paper: { citationCount: "desc" } },
         include: {
           paper: {
             select: {
@@ -35,53 +35,55 @@ async function getResearcher(id: string) {
               year: true,
               journal: true,
               citationCount: true,
+              isOpenAccess: true,
+              abstract: true,
             },
           },
         },
       },
     },
   });
-  if (profile) return profile;
-  // Fallback to the older Researcher model. Empty in v1 but kept so
-  // links from the (future) author-extraction agent don't 404.
-  const legacy = await prisma.researcher.findUnique({ where: { id } });
-  return legacy
-    ? {
-        id: legacy.id,
-        name: legacy.name,
-        email: legacy.email,
-        institution: legacy.institution,
-        website: legacy.website,
-        title: null,
-        country: null,
-        department: null,
-        bio: null,
-        topics: [],
-        paperCount: legacy.paperCount,
-        totalCitations: 0,
-        hIndex: 0,
-        orcid: null,
-        papers: [] as Array<{
+  if (r) return { kind: "researcher" as const, data: r };
+  // ResearchProfile fallback for talent-marketplace deep links.
+  const profile = await prisma.researchProfile.findUnique({
+    where: { id },
+    include: {
+      papers: {
+        take: 30,
+        orderBy: { paper: { citationCount: "desc" } },
+        include: {
           paper: {
-            id: string;
-            title: string;
-            year: number | null;
-            journal: string | null;
-            citationCount: number;
-          };
-        }>,
-      }
-    : null;
+            select: {
+              id: true,
+              title: true,
+              year: true,
+              journal: true,
+              citationCount: true,
+              isOpenAccess: true,
+              abstract: true,
+            },
+          },
+        },
+      },
+    },
+  });
+  return profile ? { kind: "profile" as const, data: profile } : null;
 }
 
 export async function generateMetadata({ params }: Props): Promise<Metadata> {
   const r = await getResearcher(params.id);
   if (!r) return { title: "Researcher not found" };
+  if (r.kind === "researcher") {
+    const d = r.data;
+    return {
+      title: d.name,
+      description: `${d.paperCount} papers by ${d.name}${d.institution ? ` (most-cited in ${d.institution})` : ""}. ${d.citationCount.toLocaleString()} citations on max-papers.`,
+    };
+  }
+  const d = r.data;
   return {
-    title: r.name,
-    description: `${r.title ? `${r.title} · ` : ""}${
-      r.institution ?? "Independent researcher"
-    } · ${r.paperCount} papers indexed on maxpaper.`,
+    title: d.name,
+    description: `${d.paperCount} papers by ${d.name}${d.institution ? ` at ${d.institution}` : ""}.`,
   };
 }
 
@@ -89,148 +91,188 @@ export default async function ResearcherPage({ params }: Props) {
   const r = await getResearcher(params.id);
   if (!r) notFound();
 
-  // JSON-LD Person — Google + scholar.google use this for the
-  // entity-recognition pass that drives knowledge-panel surfaces.
+  // Branch-narrow to a uniform view shape so the rest of the JSX
+  // doesn't have to keep checking r.kind. Both source models expose
+  // the same logical data — Researcher uses citationCount, the
+  // ResearchProfile uses totalCitations; collapse them here.
+  const isResearcher = r.kind === "researcher";
+  const d = r.data;
+  const papers = d.papers.map((pp) => pp.paper);
+  const totalCitations = isResearcher
+    ? r.data.citationCount
+    : papers.reduce((sum, p) => sum + (p.citationCount ?? 0), 0);
+  const fields = isResearcher ? r.data.fields : [];
+
   const jsonLd = {
     "@context": "https://schema.org",
     "@type": "Person",
-    name: r.name,
-    affiliation: r.institution
-      ? { "@type": "Organization", name: r.institution }
+    name: d.name,
+    affiliation: d.institution
+      ? { "@type": "Organization", name: d.institution }
       : undefined,
-    jobTitle: r.title ?? undefined,
-    url: `https://www.max-papers.com/researchers/${r.id}`,
-    sameAs: [
-      r.orcid ? `https://orcid.org/${r.orcid}` : null,
-      "website" in r && r.website ? r.website : null,
-    ].filter(Boolean),
-    description: r.bio ?? undefined,
+    url: `https://www.max-papers.com/researchers/${d.id}`,
+    description: isResearcher
+      ? `${d.paperCount} papers, ${totalCitations.toLocaleString()} citations indexed on maxpaper.`
+      : undefined,
   };
 
   return (
-    <main style={{ maxWidth: 760, margin: "0 auto", padding: "0 20px" }}>
+    <main style={{ maxWidth: 760, margin: "0 auto", padding: "0 20px 60px" }}>
       <script
         type="application/ld+json"
         // eslint-disable-next-line react/no-danger
         dangerouslySetInnerHTML={{ __html: JSON.stringify(jsonLd) }}
       />
       <Nav />
-      <article style={{ padding: "32px 0 48px" }}>
-        <Link href="/" style={backLinkStyle}>
-          ← Back to maxpaper
+
+      <article style={{ padding: "32px 0 0" }}>
+        <Link href="/researchers" style={backLinkStyle}>
+          ← All researchers
         </Link>
-        <p style={kickerStyle}>Researcher</p>
-        <h1 style={titleStyle}>{r.name}</h1>
-        <p style={{ fontSize: 13, color: "#666", margin: "8px 0 0" }}>
-          {r.title ? `${r.title} · ` : ""}
-          {r.institution ?? "Independent"}
-          {r.department ? ` · ${r.department}` : ""}
-          {r.country ? ` · ${r.country}` : ""}
-        </p>
 
-        <div style={{ display: "flex", gap: 26, marginTop: 18 }}>
-          <Stat n={r.paperCount} label="papers" />
-          <Stat n={r.totalCitations} label="citations" />
-          <Stat n={r.hIndex} label="h-index" />
-        </div>
-
-        {r.bio ? (
-          <section style={{ marginTop: 28 }}>
-            <h2 style={sectionLabelStyle}>About</h2>
-            <p
-              style={{
-                fontSize: 14,
-                color: "#333",
-                lineHeight: 1.7,
-                margin: "10px 0 0",
-                whiteSpace: "pre-wrap",
-              }}
-            >
-              {r.bio}
+        <div
+          style={{
+            marginTop: 16,
+            paddingBottom: 24,
+            borderBottom: "0.5px solid #e8e0c8",
+          }}
+        >
+          <p style={kickerStyle}>Researcher</p>
+          <h1 style={titleStyle}>{d.name}</h1>
+          {d.institution ? (
+            <p style={{ fontSize: 14, color: "#888", margin: "8px 0 12px" }}>
+              {d.institution}
+              {isResearcher ? (
+                <span style={{ fontSize: 11, color: "#bbb", marginLeft: 8 }}>
+                  (most frequent journal — institution inference is heuristic)
+                </span>
+              ) : null}
             </p>
-          </section>
-        ) : null}
+          ) : null}
 
-        {r.topics && r.topics.length > 0 ? (
-          <section style={{ marginTop: 28 }}>
-            <h2 style={sectionLabelStyle}>Topics</h2>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 10 }}>
-              {r.topics.map((t: string) => (
-                <span
-                  key={t}
+          <div style={{ display: "flex", gap: 26, marginTop: 12 }}>
+            <Stat n={d.paperCount} label="papers" />
+            <Stat n={totalCitations} label="citations" />
+            {fields.length > 0 ? (
+              <div>
+                <div style={{ fontSize: 13, color: "#555", marginTop: 2 }}>
+                  {fields.slice(0, 3).join(", ")}
+                </div>
+                <div
                   style={{
-                    fontSize: 11,
-                    padding: "3px 8px",
-                    background: "#faf8f5",
-                    color: "#555",
+                    fontSize: 10,
+                    color: "#888",
+                    textTransform: "uppercase",
+                    letterSpacing: ".08em",
+                    marginTop: 2,
                   }}
                 >
-                  {t}
-                </span>
-              ))}
-            </div>
-          </section>
-        ) : null}
+                  fields
+                </div>
+              </div>
+            ) : null}
+          </div>
+        </div>
 
         <section style={{ marginTop: 28 }}>
-          <h2 style={sectionLabelStyle}>
-            Papers{r.papers && r.papers.length > 0 ? ` (${r.papers.length})` : ""}
-          </h2>
-          {!r.papers || r.papers.length === 0 ? (
+          <h2 style={sectionLabelStyle}>Papers ({papers.length})</h2>
+          {papers.length === 0 ? (
             <p style={{ fontSize: 13, color: "#888", marginTop: 10 }}>
-              No papers linked yet.
+              No papers linked yet — extraction agent may not have run for
+              this profile.
             </p>
           ) : (
             <ul style={{ listStyle: "none", padding: 0, margin: "10px 0 0" }}>
-              {r.papers.map((pp) => (
+              {papers.map((p) => (
                 <li
-                  key={pp.paper.id}
-                  style={{ padding: "10px 0", borderBottom: "0.5px solid #f0ebd9" }}
+                  key={p.id}
+                  style={{
+                    padding: "14px 0",
+                    borderBottom: "0.5px solid #f0ebd9",
+                  }}
                 >
-                  <Link
-                    href={`/papers/${pp.paper.id}`}
+                  <div
                     style={{
-                      fontSize: 13,
-                      color: "#111",
-                      textDecoration: "none",
-                      fontWeight: 500,
+                      display: "flex",
+                      gap: 6,
+                      alignItems: "center",
+                      flexWrap: "wrap",
+                      marginBottom: 4,
                     }}
                   >
-                    {pp.paper.title}
-                  </Link>
-                  <div style={{ fontSize: 11, color: "#888", marginTop: 2 }}>
-                    {pp.paper.year ?? "—"}
-                    {pp.paper.journal ? ` · ${pp.paper.journal}` : ""}
-                    {pp.paper.citationCount > 0
-                      ? ` · ${pp.paper.citationCount.toLocaleString("en-US")} citations`
-                      : ""}
+                    {p.isOpenAccess ? (
+                      <span
+                        style={{
+                          fontSize: 10,
+                          padding: "2px 7px",
+                          background: "#eaf3de",
+                          color: "#3b6d11",
+                        }}
+                      >
+                        Open access
+                      </span>
+                    ) : null}
+                    <span style={{ fontSize: 11, color: "#bbb" }}>
+                      {p.year ?? "—"}
+                      {p.journal ? ` · ${p.journal}` : ""}
+                      {p.citationCount > 0
+                        ? ` · ${p.citationCount.toLocaleString("en-US")} citations`
+                        : ""}
+                    </span>
                   </div>
+                  <Link
+                    href={`/papers/${p.id}`}
+                    style={{
+                      fontSize: 14,
+                      fontWeight: 500,
+                      color: "#111",
+                      textDecoration: "none",
+                      display: "block",
+                      marginBottom: 4,
+                      lineHeight: 1.4,
+                    }}
+                  >
+                    {p.title}
+                  </Link>
+                  <p
+                    style={{
+                      fontSize: 12,
+                      color: "#666",
+                      lineHeight: 1.6,
+                      margin: 0,
+                    }}
+                  >
+                    {p.abstract ? p.abstract.slice(0, 200) + "…" : null}
+                  </p>
                 </li>
               ))}
             </ul>
           )}
         </section>
 
-        <footer
-          style={{
-            marginTop: 36,
-            paddingTop: 18,
-            borderTop: "0.5px solid #e8e0c8",
-            fontSize: 11,
-            color: "#aaa",
-            lineHeight: 1.7,
-          }}
-        >
-          {r.orcid ? <div>ORCID: {r.orcid}</div> : null}
-          <div>
+        {isResearcher ? (
+          <footer
+            style={{
+              marginTop: 36,
+              paddingTop: 18,
+              borderTop: "0.5px solid #e8e0c8",
+              fontSize: 11,
+              color: "#aaa",
+              lineHeight: 1.7,
+            }}
+          >
             <Link
-              href={`/talent/profile/${r.id}`}
-              style={{ color: "#888", textDecoration: "underline", textDecorationColor: "#e8e0c8" }}
+              href={`/talent/profile/${d.id}`}
+              style={{
+                color: "#888",
+                textDecoration: "underline",
+                textDecorationColor: "#e8e0c8",
+              }}
             >
-              View talent profile →
+              Looking for this researcher in the talent marketplace? →
             </Link>
-          </div>
-        </footer>
+          </footer>
+        ) : null}
       </article>
     </main>
   );
@@ -249,7 +291,7 @@ const kickerStyle: React.CSSProperties = {
   letterSpacing: ".18em",
   textTransform: "uppercase",
   color: "#c8a84b",
-  margin: "18px 0 0",
+  margin: 0,
 };
 const titleStyle: React.CSSProperties = {
   fontSize: 26,
@@ -277,9 +319,9 @@ function Stat({ n, label }: { n: number; label: string }) {
       <div
         style={{
           fontSize: 10,
+          color: "#888",
           textTransform: "uppercase",
           letterSpacing: ".08em",
-          color: "#888",
           marginTop: 2,
         }}
       >

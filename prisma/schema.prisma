@@ -39,9 +39,10 @@ model Paper {
   // Wiki-layer relations — joins populated by agents/populate-entities.ts
   // from Paper.journal / fields[] / keywords[]. The string columns
   // stay (still used by search) — these are the indexed wiki layer.
-  paperTopics     PaperTopic[]
-  paperMethods    PaperMethod[]
-  paperInstitutes PaperInstitute[]
+  paperTopics       PaperTopic[]
+  paperMethods      PaperMethod[]
+  paperInstitutes   PaperInstitute[]
+  paperResearchers  PaperResearcher[]
 
   @@index([title])
   @@index([year])
@@ -49,17 +50,41 @@ model Paper {
 }
 
 model Researcher {
-  id          String   @id @default(cuid())
+  id            String            @id @default(cuid())
   // Unique on name so the extraction agent can bulk-upsert without
   // race-creating duplicate rows for the same author across batches.
-  // Table is empty before the constraint is added, so the migration
-  // is safe (no pre-existing dups to collide).
-  name        String   @unique
-  institution String?
-  email       String?
-  website     String?
-  paperCount  Int      @default(0)
-  createdAt   DateTime @default(now())
+  name          String            @unique
+  // URL slug for /researchers/[id] vs slug routes. Optional + unique.
+  slug          String?           @unique
+  // Most-frequent journal home / department guess from the agent.
+  // Free-text; populated by extract-entities heuristically (most-
+  // common journal across author's papers).
+  institution   String?
+  email         String?
+  website       String?
+  paperCount    Int               @default(0)
+  // Sum of Paper.citationCount across linked papers — cached at
+  // extract time so /researchers/[id] doesn't have to aggregate.
+  citationCount Int               @default(0)
+  // Top fields the author publishes in (derived from Paper.fields[]).
+  fields        String[]
+  // Many-to-many to Paper via PaperResearcher join — populated
+  // alongside Researcher itself so wiki pages have linked papers.
+  papers        PaperResearcher[]
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+}
+
+// Join table — researcher ↔ paper. Composite primary key prevents
+// duplicate links from re-runs of the extraction agent.
+model PaperResearcher {
+  paperId      String
+  researcherId String
+  paper        Paper      @relation(fields: [paperId], references: [id], onDelete: Cascade)
+  researcher   Researcher @relation(fields: [researcherId], references: [id], onDelete: Cascade)
+
+  @@id([paperId, researcherId])
+  @@index([researcherId])
 }
 
 // ──────────────────────────────────────────────────────────────────

@@ -56,20 +56,63 @@ function slugify(s: string): string {
     .slice(0, 100);
 }
 
-// ── Pass 1: Researcher extraction ───────────────────────────────────
+// Pick the most-frequent journal as a researcher's "institution" guess
+// — proxy until we have OpenAlex affiliations. Most academics publish
+// repeatedly in a small set of journals; the modal one is a useful
+// label even if it's not a literal employer.
+function mostFrequent(items: string[]): string | undefined {
+  if (items.length === 0) return undefined;
+  const counts = new Map<string, number>();
+  for (const x of items) counts.set(x, (counts.get(x) ?? 0) + 1);
+  let best: [string, number] | null = null;
+  for (const entry of counts.entries()) {
+    if (!best || entry[1] > best[1]) best = entry;
+  }
+  return best?.[0];
+}
+
+function topN(items: string[], n: number): string[] {
+  const counts = new Map<string, number>();
+  for (const x of items) counts.set(x, (counts.get(x) ?? 0) + 1);
+  return Array.from(counts.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, n)
+    .map(([name]) => name);
+}
+
+type ResearcherAccum = {
+  name: string; // display-cased
+  paperCount: number;
+  citationSum: number;
+  fields: string[]; // all fields seen, for top-N at end
+  journals: string[]; // all journals seen, for modal at end
+  // Each author appears in many papers; collect their paper ids so
+  // we can populate PaperResearcher joins after Researcher rows exist.
+  paperIds: string[];
+};
+
+// ── Pass 1: Researcher extraction (no AI) ──────────────────────────
+// Single scan, in-memory aggregate. Bulk-insert Researcher rows, then
+// look up each researcher's id and bulk-insert PaperResearcher joins.
 async function extractResearchers() {
-  console.log("[extract] PASS 1: Researcher (no AI)");
+  console.log("[extract] PASS 1: Researcher + PaperResearcher (no AI)");
   const t0 = Date.now();
-  // name (case-preserved) → { count, displayName }
-  const counts = new Map<string, { count: number; name: string }>();
+  const accum = new Map<string, ResearcherAccum>();
   let scanned = 0;
   let cursor: string | undefined;
+
   while (true) {
     const batch = await prisma.paper.findMany({
       take: SCAN_BATCH,
       ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
       orderBy: { id: "asc" },
-      select: { id: true, authors: true },
+      select: {
+        id: true,
+        authors: true,
+        citationCount: true,
+        fields: true,
+        journal: true,
+      },
     });
     if (batch.length === 0) break;
     for (const p of batch) {
@@ -78,42 +121,125 @@ async function extractResearchers() {
         const name = String(raw ?? "").trim();
         if (name.length < 3 || name.length > 200) continue;
         const key = name.toLowerCase();
-        const prev = counts.get(key);
-        if (prev) prev.count++;
-        else counts.set(key, { count: 1, name });
+        let row = accum.get(key);
+        if (!row) {
+          row = {
+            name,
+            paperCount: 0,
+            citationSum: 0,
+            fields: [],
+            journals: [],
+            paperIds: [],
+          };
+          accum.set(key, row);
+        }
+        row.paperCount++;
+        row.citationSum += p.citationCount ?? 0;
+        for (const f of p.fields ?? []) row.fields.push(f);
+        if (p.journal) row.journals.push(p.journal);
+        // Cap paperIds at 500 per author — even prolific authors
+        // (~200 papers) fit; this caps memory for the ~50-author
+        // mega-survey outliers.
+        if (row.paperIds.length < 500) row.paperIds.push(p.id);
       }
     }
     scanned += batch.length;
     cursor = batch[batch.length - 1]!.id;
     if (scanned % 50_000 === 0 || batch.length < SCAN_BATCH) {
-      console.log(`[extract] scanned ${scanned.toLocaleString()} papers, ${counts.size.toLocaleString()} unique authors so far`);
+      console.log(
+        `[extract] scanned ${scanned.toLocaleString()} papers, ${accum.size.toLocaleString()} unique authors`,
+      );
     }
     if (batch.length < SCAN_BATCH) break;
   }
   console.log(
-    `[extract] scan done: ${scanned.toLocaleString()} papers, ${counts.size.toLocaleString()} unique authors`,
+    `[extract] scan done: ${scanned.toLocaleString()} papers, ${accum.size.toLocaleString()} unique authors`,
   );
 
-  // Bulk insert in chunks. createMany with skipDuplicates handles
-  // any case-collision races (unique on name, but case-insensitive
-  // key in JS land lets two casings produce one key here).
-  const rows = Array.from(counts.values()).map(({ name, count }) => ({
-    name: name.slice(0, 200),
-    paperCount: count,
-  }));
+  // Build Researcher rows. Slug handling: slug @unique, so any two
+  // authors whose names slugify to the same string need a -N suffix.
+  const slugSeen = new Set<string>();
+  const rows = Array.from(accum.values()).map((a) => {
+    let baseSlug = slugify(a.name);
+    if (!baseSlug) baseSlug = "researcher";
+    let candidate = baseSlug;
+    let n = 1;
+    while (slugSeen.has(candidate)) candidate = `${baseSlug}-${++n}`;
+    slugSeen.add(candidate);
+    return {
+      key: a.name.toLowerCase(),
+      data: {
+        name: a.name.slice(0, 200),
+        slug: candidate,
+        paperCount: a.paperCount,
+        citationCount: a.citationSum,
+        fields: topN(a.fields, 5),
+        institution: mostFrequent(a.journals) ?? null,
+      },
+    };
+  });
+
+  // Bulk insert in chunks.
   let inserted = 0;
   for (let i = 0; i < rows.length; i += RESEARCHER_CHUNK) {
+    const data = rows.slice(i, i + RESEARCHER_CHUNK).map((r) => r.data);
     const result = await prisma.researcher.createMany({
-      data: rows.slice(i, i + RESEARCHER_CHUNK),
+      data,
       skipDuplicates: true,
     });
     inserted += result.count;
     if ((i / RESEARCHER_CHUNK) % 10 === 0) {
-      console.log(`[extract] researchers inserted ${inserted.toLocaleString()} / ${rows.length.toLocaleString()}`);
+      console.log(
+        `[extract] researchers inserted ${inserted.toLocaleString()} / ${rows.length.toLocaleString()}`,
+      );
+    }
+  }
+  console.log(
+    `[extract] Researcher inserts complete: ${inserted.toLocaleString()} rows`,
+  );
+
+  // Now look up each researcher's id and build PaperResearcher joins.
+  // We do this in name-batches to avoid one giant IN clause.
+  console.log("[extract] building PaperResearcher joins…");
+  const NAME_CHUNK = 5_000;
+  const JOIN_CHUNK = 5_000;
+  let joinsInserted = 0;
+  const names = rows.map((r) => r.data.name);
+  for (let i = 0; i < names.length; i += NAME_CHUNK) {
+    const slice = names.slice(i, i + NAME_CHUNK);
+    const found = await prisma.researcher.findMany({
+      where: { name: { in: slice } },
+      select: { id: true, name: true },
+    });
+    const idByName = new Map(found.map((r) => [r.name, r.id]));
+    // Build joins for this slice's researchers.
+    const joins: Array<{ paperId: string; researcherId: string }> = [];
+    for (const r of rows.slice(i, i + NAME_CHUNK)) {
+      const rid = idByName.get(r.data.name);
+      if (!rid) continue;
+      const orig = accum.get(r.key);
+      if (!orig) continue;
+      for (const pid of orig.paperIds) {
+        joins.push({ paperId: pid, researcherId: rid });
+      }
+    }
+    for (let j = 0; j < joins.length; j += JOIN_CHUNK) {
+      const result = await prisma.paperResearcher.createMany({
+        data: joins.slice(j, j + JOIN_CHUNK),
+        skipDuplicates: true,
+      });
+      joinsInserted += result.count;
+    }
+    if ((i / NAME_CHUNK) % 5 === 0) {
+      console.log(
+        `[extract] joins so far: ${joinsInserted.toLocaleString()} (researcher batch ${i.toLocaleString()})`,
+      );
     }
   }
   const secs = ((Date.now() - t0) / 1000).toFixed(1);
-  console.log(`[extract] PASS 1 done: ${inserted.toLocaleString()} Researcher rows in ${secs}s`);
+  console.log(
+    `[extract] PASS 1 done: ${inserted.toLocaleString()} Researcher + ${joinsInserted.toLocaleString()} PaperResearcher joins in ${secs}s`,
+  );
 }
 
 // ── Pass 2: Institute extraction via AI ─────────────────────────────

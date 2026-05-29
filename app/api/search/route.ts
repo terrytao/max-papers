@@ -334,29 +334,16 @@ async function searchPapers(
   return papers.slice(0, 10);
 }
 
-// ── Simple-query heuristic ───────────────────────────────────────────
-// Detects whether a free-text query carries filter signals beyond a
-// plain topic. If it doesn't, we skip the AI extraction call entirely
-// and use the query as the FTS topic directly — typical 1-2 second
-// latency win on every "what's new in X" search.
-//
-// Trade-off: false negatives (we treat a complex query as simple)
-// would silently drop filters; false positives (we treat a simple
-// query as complex) just pay the extraction cost unnecessarily.
-// Erring on the false-positive side is safe — extraction is cached
-// so the cost is amortized to once per unique query.
-function isSimpleQuery(query: string): boolean {
-  // Author signals: "by X", "Hinton et al", "author: ...", titles
-  if (/\b(by|author|professor|dr\.?|prof\.?)\b/i.test(query)) return false;
-  // Year signals: "after 2024", "since 2020", "in 2023", "before 2010"
-  if (/\b(after|before|since|in)\s+\d{4}\b/i.test(query)) return false;
-  // Journal signals — bare "in" is too broad ("robotics in healthcare"
-  // would false-flag), so only catch "journal" / "published" /
-  // "published in".
-  if (/\b(journal|published)\b/i.test(query)) return false;
-  // Open-access signal
-  if (/\bopen[\s-]?access\b/i.test(query)) return false;
-  return true;
+// Detects whether a query likely carries filter signals (year,
+// author, quoted phrase, long NL form) and is worth handing to the
+// LLM extractor. Plain topic queries skip extraction and go straight
+// to the DB — the Haiku round-trip was the dominant cost on a cache
+// miss.
+function looksStructured(q: string): boolean {
+  return /\b(19|20)\d{2}\b/.test(q)                       // a year
+    || /\b(by|author|et al|in |since|after|before)\b/i.test(q)
+    || /["']/.test(q)                                     // quoted phrase
+    || q.trim().split(/\s+/).length > 6;                  // long NL query
 }
 
 // ── Cache helpers ────────────────────────────────────────────────────
@@ -397,15 +384,15 @@ async function runSearch(
 ): Promise<CachedSearch> {
   let filters: Filters | null = bodyFilters;
   if (!filters && query) {
-    if (isSimpleQuery(query)) {
-      filters = { topic: query };
-    } else {
+    if (looksStructured(query)) {
       try {
         filters = await extractFilters(query);
       } catch (err) {
         filters = { topic: query };
         console.error("[search] extraction failed:", (err as Error).message);
       }
+    } else {
+      filters = { topic: query };
     }
   }
   filters = filters ?? { topic: query };

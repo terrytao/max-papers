@@ -35,21 +35,34 @@ const CONTACT_EMAIL = "terry.tao@max-robotics.com";
 const USER_AGENT = `Mozilla/5.0 (compatible; max-papers-crawler/1.0; +mailto:${CONTACT_EMAIL})`;
 const POLITE_DELAY_MS = 2000;
 const FETCH_TIMEOUT_MS = 30_000;
-const MAX_TEXT_CHARS = 6000;
+// Bumped from 6000 → 18000 chars after diagnosing why jobs.ac.uk +
+// EURAXESS extracted 0 jobs in the previous run: their listing
+// pages serve 100-160KB of text content, and at 6000 chars Claude
+// only saw the nav + first 1-2 jobs. ~18KB ≈ 4.5K tokens — enough
+// for 5-10 job rows from a typical listing without blowing the
+// Haiku context cheaply.
+const MAX_TEXT_CHARS = 18_000;
 const CRAWLER_EMAIL = "crawler-jobs@max-papers.com";
 const MODEL = "claude-haiku-4-5-20251001";
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
+// Sources updated after live-checking each candidate against our
+// user-agent. Dropped:
+//   • academicpositions.com  (HTTP 403 — UA-blocked)
+//   • nature.com/naturecareers (robots.txt disallow)
+//   • findaphd.com           (HTTP 403)
+//   • findapostdoc.com       (HTTP 403)
+//   • higheredjobs.com       (200 but JS-rendered; 94 bytes of text)
+// Kept (serve real text content via static HTML):
+//   • jobs.ac.uk             (158 KB of listing text)
+//   • euraxess.ec.europa.eu  (100 KB)
+//   • academicjobsonline.org (5 KB; smaller but real)
 const SOURCES: string[] = [
-  "https://academicpositions.com/jobs/position/phd",
-  "https://academicpositions.com/jobs/position/postdoc",
-  "https://academicpositions.com/jobs/position/professor",
   "https://www.jobs.ac.uk/search/?type=phd",
   "https://www.jobs.ac.uk/search/?type=postdoc",
   "https://euraxess.ec.europa.eu/jobs/search",
-  "https://www.nature.com/naturecareers/jobs?type=phd-studentship",
-  "https://www.nature.com/naturecareers/jobs?type=postdoctoral-fellowship",
+  "https://academicjobsonline.org/ajo/jobs",
 ];
 
 type CrawledJob = {
@@ -148,7 +161,10 @@ Return an array (empty [] if no real positions found). Don't make up jobs that a
   try {
     const res = await anthropic.messages.create({
       model: MODEL,
-      max_tokens: 1500,
+      // Bumped from 1500 → 3000 after EURAXESS returned 10 jobs that
+      // got truncated mid-string at ~5KB output. 10 jobs × ~250 tokens
+      // each ≈ 2500 tokens, with headroom.
+      max_tokens: 3000,
       messages: [{ role: "user", content: prompt }],
     });
     const out = res.content

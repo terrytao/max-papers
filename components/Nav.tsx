@@ -1,5 +1,9 @@
 // Shared top nav — used by every page including the homepage so the
-// link set stays in one place. Server component; no state.
+// link set stays in one place. Server component; the sign-in /
+// dashboard link is a client island (<AuthNavLink />) so the rest
+// of the nav stays static.
+
+import { AuthNavLink } from "./AuthNavLink";
 
 export function Nav() {
   return (
@@ -38,6 +42,7 @@ export function Nav() {
         <a href="/developer" style={{ fontSize: 12, color: "#888", textDecoration: "none" }}>
           Developer
         </a>
+        <AuthNavLink />
       </div>
     </nav>
   );

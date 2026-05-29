@@ -34,7 +34,14 @@ model Paper {
   // Back-relation for the talent marketplace: a Paper can be
   // attached to multiple researcher profiles via the ProfilePaper
   // join. Required by Prisma's relation symmetry rule.
-  profileLinks  ProfilePaper[]
+  profileLinks    ProfilePaper[]
+
+  // Wiki-layer relations — joins populated by agents/populate-entities.ts
+  // from Paper.journal / fields[] / keywords[]. The string columns
+  // stay (still used by search) — these are the indexed wiki layer.
+  paperTopics     PaperTopic[]
+  paperMethods    PaperMethod[]
+  paperInstitutes PaperInstitute[]
 
   @@index([title])
   @@index([year])
@@ -211,4 +218,107 @@ model Match {
   @@unique([positionId, profileId])
   @@index([score])
   @@index([profileId, score])
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Wiki layer — programmatic-SEO surface for journals/topics/methods/
+// institutes. Populated for free from existing Paper.journal /
+// fields[] / keywords[] data; no Claude calls per paper. Institute
+// rows are intentionally unpopulated in v1 (OpenAlex affiliations
+// aren't in our current ingest path).
+//
+// `description` on each entity is reserved for one-shot AI-generated
+// summaries cached at write time — NOT generated per page render.
+
+model Journal {
+  id           String   @id @default(cuid())
+  name         String   @unique
+  slug         String   @unique
+  impactFactor Float?
+  paperCount   Int      @default(0)
+  description  String?  @db.Text
+  website      String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  // No FK on Paper — journal is matched by name. Saves a backfill
+  // pass over 10k+ papers when the populator runs.
+}
+
+model Topic {
+  id          String       @id @default(cuid())
+  name        String
+  slug        String       @unique
+  description String?      @db.Text
+  paperCount  Int          @default(0)
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  papers      PaperTopic[]
+
+  @@index([paperCount])
+}
+
+model Method {
+  id          String        @id @default(cuid())
+  name        String
+  slug        String        @unique
+  description String?       @db.Text
+  paperCount  Int           @default(0)
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+  papers      PaperMethod[]
+
+  @@index([paperCount])
+}
+
+model Institute {
+  id          String           @id @default(cuid())
+  name        String           @unique
+  slug        String           @unique
+  shortName   String?
+  type        String?
+  country     String?
+  city        String?
+  website     String?
+  description String?          @db.Text
+  paperCount  Int              @default(0)
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+  papers      PaperInstitute[]
+
+  @@index([paperCount])
+  @@index([country])
+}
+
+// Join tables — many-to-many between Paper and the three entity
+// types that need it. Journal stays string-matched (one journal per
+// paper, no benefit to a separate join row per paper).
+model PaperTopic {
+  paperId String
+  topicId String
+  paper   Paper @relation(fields: [paperId], references: [id], onDelete: Cascade)
+  topic   Topic @relation(fields: [topicId], references: [id], onDelete: Cascade)
+
+  @@id([paperId, topicId])
+  @@index([topicId])
+}
+
+model PaperMethod {
+  paperId  String
+  methodId String
+  paper    Paper  @relation(fields: [paperId], references: [id], onDelete: Cascade)
+  method   Method @relation(fields: [methodId], references: [id], onDelete: Cascade)
+
+  @@id([paperId, methodId])
+  @@index([methodId])
+}
+
+model PaperInstitute {
+  paperId     String
+  instituteId String
+  paper       Paper     @relation(fields: [paperId], references: [id], onDelete: Cascade)
+  institute   Institute @relation(fields: [instituteId], references: [id], onDelete: Cascade)
+
+  @@id([paperId, instituteId])
+  @@index([instituteId])
 }

@@ -1,52 +1,12 @@
 // maxpaper homepage. Server component — the search box is a plain
 // HTML <form action="/search" method="GET"> that GETs to /search?q=…
-// The /search route doesn't exist yet; submitting will 404 until the
-// search backend is built. Honest signal that's the next thing.
+
+import { Nav } from "@/components/Nav";
 
 export default function Home() {
   return (
     <main style={{ maxWidth: 680, margin: "0 auto", padding: "0 20px" }}>
-      <nav
-        style={{
-          borderBottom: "0.5px solid #e8e0c8",
-          padding: "12px 0",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-          marginBottom: 0,
-        }}
-      >
-        <div
-          style={{
-            fontSize: 15,
-            fontWeight: 500,
-            color: "#111",
-            letterSpacing: "-.01em",
-          }}
-        >
-          maxpaper
-        </div>
-        <div style={{ display: "flex", gap: 20 }}>
-          <a
-            href="/browse"
-            style={{ fontSize: 12, color: "#888", textDecoration: "none" }}
-          >
-            Browse
-          </a>
-          <a
-            href="/researchers"
-            style={{ fontSize: 12, color: "#888", textDecoration: "none" }}
-          >
-            Researchers
-          </a>
-          <a
-            href="/developer"
-            style={{ fontSize: 12, color: "#888", textDecoration: "none" }}
-          >
-            Developer
-          </a>
-        </div>
-      </nav>
+      <Nav />
 
       <div
         style={{

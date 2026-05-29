@@ -100,27 +100,6 @@ Return exactly this JSON structure:
   }
 }
 
-// Tiny English stopword set — enough to keep multi-word topics like
-// "neural network for cancer detection" from over-constraining the
-// query. Tokens shorter than 3 chars are also dropped.
-const STOPWORDS = new Set([
-  "the", "a", "an", "of", "for", "in", "on", "and", "or", "with", "to",
-  "by", "is", "are", "be", "as", "at", "from", "into", "that", "this",
-  "these", "those", "than", "papers", "paper", "about", "any",
-]);
-
-function tokenizeTopic(topic: string): string[] {
-  return Array.from(
-    new Set(
-      topic
-        .toLowerCase()
-        .replace(/[^a-z0-9\s]/g, " ")
-        .split(/\s+/)
-        .filter((w) => w.length > 2 && !STOPWORDS.has(w)),
-    ),
-  ).slice(0, 6); // cap so a paragraph-length topic doesn't explode the query
-}
-
 // Flexible author-name search via raw SQL.
 //
 // Prisma's `{ authors: { has: ... } }` is exact-string match against
@@ -168,34 +147,77 @@ async function findPapersByPartialAuthor(author: string): Promise<string[]> {
   return rows.map((r) => r.id);
 }
 
+// Postgres FTS topic search.
+//
+// Replaces the old tokenized-ILIKE topic branch: at 100k+ rows ILIKE
+// over title+abstract is a slow sequential scan. With a GIN index
+// on `to_tsvector('english', title || ' ' || abstract)`
+// (created by agents/add-fts-index.ts) this is index-backed and
+// 10-100× faster.
+//
+// Returns matching paper ids, ranked by ts_rank desc then citation
+// count desc. The caller folds them into the where via
+// `id: { in: ids }`, so all the other structured filters (author,
+// year, journal, openAccess) and AND/OR mode keep working through
+// the existing Prisma path. The Prisma main query orders by
+// citationCount within the FTS-matched set — same tradeoff as the
+// author helper: filter via raw SQL, order via the typed query.
+async function searchPaperIdsByFTS(query: string): Promise<string[]> {
+  // Token guard: drop 1-char fragments and non-alphanum noise so the
+  // tsquery we hand to Postgres doesn't include things like ':*' that
+  // tsquery rejects. Keep 2-char tokens so common acronyms (AI / ML
+  // / CV) still search.
+  const tokens = query
+    .toLowerCase()
+    .split(/\s+/)
+    .map((w) => w.replace(/[^a-z0-9]/g, ""))
+    .filter((w) => w.length >= 2)
+    .slice(0, 8); // paragraph-length topic shouldn't generate a huge tsquery
+  if (tokens.length === 0) return [];
+
+  // `:*` enables prefix matching (so "neur:*" matches "neural",
+  // "neuroscience", "neurotransmitter"). `&` is AND across tokens.
+  const tsQuery = tokens.map((t) => `${t}:*`).join(" & ");
+
+  try {
+    const rows = await prisma.$queryRaw<Array<{ id: string }>>`
+      SELECT id
+      FROM "Paper"
+      WHERE to_tsvector('english', coalesce(title, '') || ' ' || coalesce(abstract, ''))
+        @@ to_tsquery('english', ${tsQuery})
+      ORDER BY
+        ts_rank(
+          to_tsvector('english', coalesce(title, '') || ' ' || coalesce(abstract, '')),
+          to_tsquery('english', ${tsQuery})
+        ) DESC,
+        "citationCount" DESC
+      LIMIT 200
+    `;
+    return rows.map((r) => r.id);
+  } catch (err) {
+    // to_tsquery throws on malformed input ("&" alone, all stopwords
+    // dropped, etc.). Don't take the API down for a search hiccup —
+    // return empty so the topic filter becomes a no-op.
+    console.error(
+      "[search] FTS query failed for tsQuery=" +
+        JSON.stringify(tsQuery) +
+        ": " +
+        (err as Error).message,
+    );
+    return [];
+  }
+}
+
 async function buildConditions(f: Filters): Promise<Prisma.PaperWhereInput[]> {
   const conds: Prisma.PaperWhereInput[] = [];
 
   const topic = f.topic?.trim();
   if (topic) {
-    const tokens = tokenizeTopic(topic);
-    if (tokens.length > 0) {
-      // Each tokenized topic becomes one condition group: every
-      // significant word must appear somewhere (title/abstract/
-      // keywords). Wrapped in a nested AND so OR mode treats it as
-      // a single "topic matched" condition rather than exploding it.
-      conds.push({
-        AND: tokens.map((tok) => ({
-          OR: [
-            { title: { contains: tok, mode: "insensitive" as const } },
-            { abstract: { contains: tok, mode: "insensitive" as const } },
-            { keywords: { has: tok } },
-          ],
-        })),
-      });
-    } else {
-      conds.push({
-        OR: [
-          { title: { contains: topic, mode: "insensitive" } },
-          { abstract: { contains: topic, mode: "insensitive" } },
-        ],
-      });
-    }
+    const ftsIds = await searchPaperIdsByFTS(topic);
+    // Push even an empty array — in AND mode that correctly returns
+    // zero results when the topic doesn't match anything; in OR mode
+    // it's a no-op group.
+    conds.push({ id: { in: ftsIds } });
   }
 
   const author = f.author?.trim();

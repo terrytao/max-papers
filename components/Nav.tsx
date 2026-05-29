@@ -32,6 +32,9 @@ export function Nav() {
         <a href="/researchers" style={{ fontSize: 12, color: "#888", textDecoration: "none" }}>
           Researchers
         </a>
+        <a href="/talent" style={{ fontSize: 12, color: "#888", textDecoration: "none" }}>
+          Talent
+        </a>
         <a href="/developer" style={{ fontSize: 12, color: "#888", textDecoration: "none" }}>
           Developer
         </a>

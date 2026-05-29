@@ -31,6 +31,11 @@ model Paper {
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 
+  // Back-relation for the talent marketplace: a Paper can be
+  // attached to multiple researcher profiles via the ProfilePaper
+  // join. Required by Prisma's relation symmetry rule.
+  profileLinks  ProfilePaper[]
+
   @@index([title])
   @@index([year])
   @@index([citationCount])
@@ -46,4 +51,164 @@ model Researcher {
   createdAt   DateTime @default(now())
 
   @@index([name])
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Talent marketplace — researcher profiles + open positions + AI
+// matching. Five new models. All write surfaces (profile creation,
+// position posting, application submission) are anonymous + auto-
+// live in v1 — same spam-risk profile we discussed for max-robotics
+// writes, only sharper here because the data is identity-bearing
+// (emails, employers). Adding auth + ownership is the obvious next
+// step before this opens to the world.
+
+model ResearchProfile {
+  id              String         @id @default(cuid())
+  name            String
+  email           String         @unique
+  title           String?
+  institution     String?
+  department      String?
+  lab             String?
+  country         String?
+  website         String?
+  bio             String?        @db.Text
+  // External identifiers — populated only when the user provides
+  // them. orcid is the canonical academic ID and gets @unique so
+  // a verified handle can't be claimed twice.
+  orcid           String?        @unique
+  googleScholarId String?
+  twitterHandle   String?
+  linkedinUrl     String?
+  // researcher | pi | recruiter | student — drives which UI sections
+  // render on the profile + which dashboards (matches vs received-
+  // applications) make sense for them.
+  profileType     String         @default("researcher")
+  // Free-text tags: "phd-position", "postdoc", "collaborator",
+  // "industry-job". Driving filter chips on the talent hub.
+  lookingFor      String[]
+  availableFrom   DateTime?
+  // Self-declared topic + method interests beyond what their papers
+  // already imply. Used by the matching engine as a weak signal
+  // when the publication footprint is small.
+  topics          String[]
+  methods         String[]
+  // Citation metrics — copy-on-link or computed from the linked
+  // Paper rows. Updated by a (future) refresh agent rather than
+  // self-reported.
+  hIndex          Int            @default(0)
+  totalCitations  Int            @default(0)
+  paperCount      Int            @default(0)
+  papers          ProfilePaper[]
+  // Positions the profile has POSTED (PI side).
+  positions       Position[]
+  // Applications the profile has SENT (applicant side).
+  applications    Application[]
+  // Match rows pointing at this profile — required Prisma back-
+  // relation symmetric to Match.profile.
+  matches         Match[]
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  @@index([profileType])
+}
+
+// Many-to-many join between ResearchProfile and Paper so a profile
+// can claim authorship of multiple papers (and a paper can be
+// claimed by multiple co-authors over time).
+model ProfilePaper {
+  id        String          @id @default(cuid())
+  profileId String
+  profile   ResearchProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  paperId   String
+  paper     Paper           @relation(fields: [paperId], references: [id], onDelete: Cascade)
+  addedAt   DateTime        @default(now())
+
+  @@unique([profileId, paperId])
+  @@index([paperId])
+}
+
+model Position {
+  id             String          @id @default(cuid())
+  title          String
+  // phd | postdoc | job | fellowship | grant — drives the type
+  // filter on the talent hub.
+  type           String
+  description    String          @db.Text
+  // Topical and methodological keywords used by the matching engine.
+  researchTopics String[]
+  methods        String[]
+  requirements   String[]
+  institution    String
+  department     String?
+  lab            String?
+  country        String?
+  city           String?
+  funded         Boolean         @default(true)
+  fundingDetails String?
+  salary         String?
+  deadline       DateTime?
+  startDate      DateTime?
+  duration       String?
+  contactEmail   String?
+  website        String?
+  // open | closed | filled — closed positions stop appearing in
+  // search but stay readable at /talent/positions/[id].
+  status         String          @default("open")
+  postedById     String
+  postedBy       ResearchProfile @relation(fields: [postedById], references: [id], onDelete: Cascade)
+  applications   Application[]
+  matches        Match[]
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  @@index([status, type])
+  @@index([country])
+  @@index([deadline])
+}
+
+model Application {
+  id          String          @id @default(cuid())
+  positionId  String
+  position    Position        @relation(fields: [positionId], references: [id], onDelete: Cascade)
+  applicantId String
+  applicant   ResearchProfile @relation(fields: [applicantId], references: [id], onDelete: Cascade)
+  coverLetter String?         @db.Text
+  // pending | shortlisted | rejected | accepted | withdrawn
+  status      String          @default("pending")
+  // Optional pointer back to the Match row that triggered the
+  // application — lets the PI see "why" alongside the application.
+  matchId     String?
+  match       Match?          @relation(fields: [matchId], references: [id])
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  @@unique([positionId, applicantId])
+  @@index([status])
+}
+
+model Match {
+  id            String          @id @default(cuid())
+  positionId    String
+  position      Position        @relation(fields: [positionId], references: [id], onDelete: Cascade)
+  profileId     String
+  profile       ResearchProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  // Composite 0-100 score plus the per-axis breakdown the UI
+  // renders as a stacked bar.
+  score         Float
+  topicScore    Float           @default(0)
+  citationScore Float           @default(0)
+  methodScore   Float           @default(0)
+  venueScore    Float           @default(0)
+  reasons       String[]
+  sharedTopics  String[]
+  sharedMethods String[]
+  citedPapers   String[]
+  notified      Boolean         @default(false)
+  applications  Application[]
+  createdAt     DateTime        @default(now())
+
+  @@unique([positionId, profileId])
+  @@index([score])
+  @@index([profileId, score])
 }

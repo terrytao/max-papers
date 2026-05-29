@@ -376,6 +376,135 @@ server.tool(
   },
 );
 
+server.tool(
+  "find_positions",
+  "Find research positions (PhD, postdoc, jobs, fellowships, grants) on max-papers.com matching the given filters. Returns up to 20 open positions sorted by most-recently-posted.",
+  {
+    topic: z
+      .string()
+      .optional()
+      .describe("Research topic — exact match against Position.researchTopics"),
+    type: z
+      .string()
+      .optional()
+      .describe("phd | postdoc | job | fellowship | grant"),
+    institution: z.string().optional(),
+    country: z.string().optional(),
+    funded: z
+      .boolean()
+      .optional()
+      .describe("If true, only funded positions"),
+    limit: z.number().optional().default(10),
+  },
+  async ({ topic, type, institution, country, funded, limit }) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const where: any = { status: "open" };
+    if (type) where.type = type;
+    if (institution)
+      where.institution = { contains: institution, mode: "insensitive" };
+    if (country) where.country = { contains: country, mode: "insensitive" };
+    if (funded) where.funded = true;
+    if (topic) where.researchTopics = { has: topic };
+
+    const positions = await prisma.position.findMany({
+      where,
+      take: Math.min(limit ?? 10, 20),
+      orderBy: [
+        { deadline: { sort: "asc", nulls: "last" } },
+        { createdAt: "desc" },
+      ],
+      include: {
+        postedBy: { select: { name: true, institution: true } },
+      },
+    });
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              count: positions.length,
+              source: "max-papers.com/talent",
+              results: positions.map((p) => ({
+                id: p.id,
+                title: p.title,
+                type: p.type,
+                institution: p.institution,
+                country: p.country,
+                funded: p.funded,
+                deadline: p.deadline?.toISOString().split("T")[0] ?? null,
+                topics: p.researchTopics,
+                postedBy: p.postedBy.name,
+                url: `https://www.max-papers.com/talent/positions/${p.id}`,
+              })),
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  },
+);
+
+server.tool(
+  "get_research_matches",
+  "Get positions that match a researcher's profile, ranked by the AI matching score (topic overlap, citation signal, methods, venues, field, publication count).",
+  {
+    profileId: z
+      .string()
+      .describe("ResearchProfile.id (cuid) on max-papers.com"),
+    minScore: z.number().optional().default(50),
+    limit: z.number().optional().default(10),
+  },
+  async ({ profileId, minScore, limit }) => {
+    const matches = await prisma.match.findMany({
+      where: { profileId, score: { gte: minScore ?? 50 } },
+      take: Math.min(limit ?? 10, 20),
+      orderBy: { score: "desc" },
+      include: {
+        position: {
+          include: {
+            postedBy: { select: { name: true, institution: true } },
+          },
+        },
+      },
+    });
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              count: matches.length,
+              source: "max-papers.com/talent",
+              results: matches.map((m) => ({
+                score: m.score,
+                position: m.position.title,
+                positionId: m.position.id,
+                institution: m.position.institution,
+                type: m.position.type,
+                breakdown: {
+                  topic: m.topicScore,
+                  citation: m.citationScore,
+                  method: m.methodScore,
+                  venue: m.venueScore,
+                },
+                reasons: m.reasons,
+                sharedTopics: m.sharedTopics,
+                sharedMethods: m.sharedMethods,
+                url: `https://www.max-papers.com/talent/positions/${m.position.id}`,
+              })),
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  },
+);
+
 const transport = new StdioServerTransport();
 await server.connect(transport);
 console.error("max-papers MCP server running (stdio)");

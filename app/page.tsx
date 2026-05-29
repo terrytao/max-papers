@@ -1,11 +1,28 @@
-// maxpaper homepage. Server component — the search box is a plain
-// HTML <form action="/search" method="GET"> that GETs to /search?q=…
+// maxpaper homepage. Server component — fetches the live paperCount
+// for the hero tagline, then mounts <SearchExperience /> (client) for
+// the interactive query/filter/results UI.
 
 import { Nav } from "@/components/Nav";
+import { SearchExperience } from "@/components/SearchExperience";
+import { prisma } from "@/lib/prisma";
 
-export default function Home() {
+export const dynamic = "force-dynamic";
+
+export default async function Home() {
+  // Real DB count whenever the ingest agent has populated rows; soft
+  // "50 million+" placeholder before then so the hero doesn't
+  // advertise "0 papers" while the index is warming up.
+  const paperCount = await prisma.paper.count().catch(() => 0);
+  const displayCount =
+    paperCount > 0
+      ? `${paperCount.toLocaleString("en-US")}+ research papers`
+      : "50 million+ research papers";
+
+  // Widen the page when search results are showing so the
+  // 220-px filter rail + result list fit comfortably. The hero
+  // itself still reads centered on the narrower column.
   return (
-    <main style={{ maxWidth: 680, margin: "0 auto", padding: "0 20px" }}>
+    <main style={{ maxWidth: 880, margin: "0 auto", padding: "0 20px" }}>
       <Nav />
 
       <div
@@ -25,7 +42,7 @@ export default function Home() {
             marginBottom: 12,
           }}
         >
-          50 million+ research papers
+          {displayCount}
         </div>
         <h1
           style={{
@@ -44,53 +61,8 @@ export default function Home() {
         <p style={{ fontSize: 13, color: "#888", marginBottom: 24 }}>
           Search in plain English. Free.
         </p>
-        <SearchBox />
+        <SearchExperience />
       </div>
     </main>
-  );
-}
-
-function SearchBox() {
-  return (
-    <form
-      action="/search"
-      method="GET"
-      style={{
-        display: "flex",
-        maxWidth: 480,
-        margin: "0 auto",
-        border: "0.5px solid #e8e0c8",
-      }}
-    >
-      <input
-        type="text"
-        name="q"
-        autoComplete="off"
-        placeholder="e.g. tactile sensing for humanoid robots"
-        style={{
-          flex: 1,
-          padding: "12px 14px",
-          fontSize: 13,
-          border: "none",
-          outline: "none",
-          background: "#fff",
-        }}
-      />
-      <button
-        type="submit"
-        style={{
-          padding: "12px 22px",
-          background: "#111",
-          color: "#fff",
-          border: "none",
-          cursor: "pointer",
-          fontSize: 12,
-          fontWeight: 500,
-          letterSpacing: ".02em",
-        }}
-      >
-        Search
-      </button>
-    </form>
   );
 }

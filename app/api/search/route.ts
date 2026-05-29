@@ -315,36 +315,29 @@ async function searchPapers(
   return papers.slice(0, 10);
 }
 
-// ── Summary ──────────────────────────────────────────────────────────
-async function generateSummary(
-  topicOrQuery: string,
-  papers: PaperRow[],
-): Promise<string> {
-  if (papers.length === 0) return "";
-  const prompt = `Write a 2-sentence plain-English summary of what these papers say about "${topicOrQuery}". Be specific, cite findings.
-
-Papers:
-${papers
-  .slice(0, 3)
-  .map((p) => `- ${p.title}: ${(p.abstract ?? "").slice(0, 180)}`)
-  .join("\n")}
-
-Return only the summary, no preamble.`;
-  try {
-    const res = await anthropic.messages.create({
-      model: MODEL,
-      max_tokens: 180,
-      messages: [{ role: "user", content: prompt }],
-    });
-    return res.content
-      .filter((b): b is Anthropic.TextBlock => b.type === "text")
-      .map((b) => b.text)
-      .join("")
-      .trim();
-  } catch (err) {
-    console.error("[search] summary failed:", (err as Error).message);
-    return "";
-  }
+// ── Simple-query heuristic ───────────────────────────────────────────
+// Detects whether a free-text query carries filter signals beyond a
+// plain topic. If it doesn't, we skip the AI extraction call entirely
+// and use the query as the FTS topic directly — typical 1-2 second
+// latency win on every "what's new in X" search.
+//
+// Trade-off: false negatives (we treat a complex query as simple)
+// would silently drop filters; false positives (we treat a simple
+// query as complex) just pay the extraction cost unnecessarily.
+// Erring on the false-positive side is safe — extraction is cached
+// so the cost is amortized to once per unique query.
+function isSimpleQuery(query: string): boolean {
+  // Author signals: "by X", "Hinton et al", "author: ...", titles
+  if (/\b(by|author|professor|dr\.?|prof\.?)\b/i.test(query)) return false;
+  // Year signals: "after 2024", "since 2020", "in 2023", "before 2010"
+  if (/\b(after|before|since|in)\s+\d{4}\b/i.test(query)) return false;
+  // Journal signals — bare "in" is too broad ("robotics in healthcare"
+  // would false-flag), so only catch "journal" / "published" /
+  // "published in".
+  if (/\b(journal|published)\b/i.test(query)) return false;
+  // Open-access signal
+  if (/\bopen[\s-]?access\b/i.test(query)) return false;
+  return true;
 }
 
 // ── Handler ──────────────────────────────────────────────────────────
@@ -364,32 +357,32 @@ export async function POST(req: NextRequest) {
     return Response.json({ error: "query or filters required" }, { status: 400 });
   }
 
-  // Step 1: extract (cached). Skipped when caller already supplied filters
-  // (filter-edit re-search from the UI).
+  // Filter resolution priority:
+  //   1. Caller-supplied filters (filter-panel re-search) → use as-is
+  //   2. Simple query → skip AI extraction, search with topic=query
+  //   3. Complex query → extract via Claude (cached)
   if (!filters && query) {
-    try {
-      filters = await extractFilters(query);
-    } catch (err) {
+    if (isSimpleQuery(query)) {
       filters = { topic: query };
-      console.error("[search] extraction failed:", (err as Error).message);
+    } else {
+      try {
+        filters = await extractFilters(query);
+      } catch (err) {
+        filters = { topic: query };
+        console.error("[search] extraction failed:", (err as Error).message);
+      }
     }
   }
   filters = filters ?? { topic: query };
 
-  // Step 2: search via FTS index. Step 3: summary runs in parallel
-  // so the LLM call doesn't block on the DB.
   const papers = await searchPapers(filters, matchMode);
-  const summaryPromise = generateSummary(filters.topic ?? query, papers);
 
-  const summary = await summaryPromise;
-
+  // No summary here — that's now /api/search/summary, called by the
+  // frontend after results render. Speed-over-completeness UX:
+  // user sees papers in <1s, summary fades in a few hundred ms later.
   return Response.json({
     papers,
-    // total ≈ papers.length — kept fast by skipping a separate COUNT
-    // query. If "showing N of M" precision becomes important the
-    // caller can fall back to a COUNT(*) hit.
     total: papers.length,
-    summary,
     filters,
     matchMode,
   });

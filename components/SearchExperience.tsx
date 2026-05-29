@@ -12,7 +12,7 @@
 // the common case is fine. AbortController-based race-proofing is
 // a follow-up if it bites.
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 
 interface FilterSuggestions {
   topics?: string[];
@@ -62,8 +62,15 @@ export function SearchExperience() {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SearchResult | null>(null);
   const [loading, setLoading] = useState(false);
+  const [summaryLoading, setSummaryLoading] = useState(false);
   const [activeFilters, setActiveFilters] = useState<Filters | null>(null);
   const [matchMode, setMatchMode] = useState<"AND" | "OR">("AND");
+
+  // Used to drop a stale summary if the user fires another search
+  // before the previous summary call returns. The summary endpoint
+  // can take 1-3s; without this guard, the late response would
+  // overwrite the new query's (empty) summary.
+  const summaryTokenRef = useRef(0);
 
   async function search(
     overrideFilters?: Filters,
@@ -73,7 +80,9 @@ export function SearchExperience() {
     const q = (overrideQuery ?? query).trim();
     if (!q && !overrideFilters) return;
     const mode = overrideMode ?? matchMode;
+    const myToken = ++summaryTokenRef.current;
     setLoading(true);
+    setSummaryLoading(false);
     try {
       const res = await fetch("/api/search", {
         method: "POST",
@@ -84,16 +93,56 @@ export function SearchExperience() {
           matchMode: mode,
         }),
       });
-      const data = (await res.json()) as SearchResult & { error?: string };
-      if (data.error) {
+      const data = (await res.json()) as Partial<SearchResult> & {
+        error?: string;
+      };
+      if (data.error || !data.papers) {
         setResults({ papers: [], total: 0, summary: "", filters: {} });
-      } else {
-        setResults(data);
-        setActiveFilters(data.filters);
+        setLoading(false);
+        return;
+      }
+      const initial: SearchResult = {
+        papers: data.papers,
+        total: data.total ?? data.papers.length,
+        summary: "",
+        filters: data.filters ?? {},
+      };
+      setResults(initial);
+      setActiveFilters(initial.filters);
+      setLoading(false);
+
+      // Phase 2: summary. Fire and forget — UI shows a placeholder
+      // until the response lands. Race-safe via summaryTokenRef.
+      if (initial.papers.length > 0) {
+        setSummaryLoading(true);
+        const topic = initial.filters?.topic ?? q;
+        const sliced = initial.papers.slice(0, 3).map((p) => ({
+          title: p.title,
+          abstract: p.abstract,
+        }));
+        fetch("/api/search/summary", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ topic, papers: sliced }),
+        })
+          .then((r) => r.json())
+          .then((s: { summary?: string }) => {
+            if (myToken !== summaryTokenRef.current) return; // superseded
+            setResults((prev) =>
+              prev ? { ...prev, summary: s.summary ?? "" } : prev,
+            );
+          })
+          .catch(() => {
+            /* leave summary blank on error */
+          })
+          .finally(() => {
+            if (myToken === summaryTokenRef.current) {
+              setSummaryLoading(false);
+            }
+          });
       }
     } catch {
       setResults({ papers: [], total: 0, summary: "", filters: {} });
-    } finally {
       setLoading(false);
     }
   }
@@ -369,7 +418,7 @@ export function SearchExperience() {
               </span>
             </div>
 
-            {results.summary ? (
+            {results.summary || summaryLoading ? (
               <div
                 style={{
                   padding: "12px 14px",
@@ -378,10 +427,12 @@ export function SearchExperience() {
                   marginBottom: 16,
                   fontSize: 13,
                   lineHeight: 1.7,
-                  color: "#444",
+                  color: results.summary ? "#444" : "#999",
+                  transition: "color .2s, opacity .2s",
+                  opacity: results.summary ? 1 : 0.85,
                 }}
               >
-                {results.summary}
+                {results.summary || "Generating summary…"}
                 <div style={{ marginTop: 6, fontSize: 11, color: "#bbb" }}>
                   Based on {results.total.toLocaleString("en-US")} paper
                   {results.total === 1 ? "" : "s"}

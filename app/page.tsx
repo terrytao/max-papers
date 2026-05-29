@@ -18,11 +18,11 @@ export default async function Home() {
       ? `${paperCount.toLocaleString("en-US")}+ research papers`
       : "50 million+ research papers";
 
-  // Widen the page when search results are showing so the
-  // 220-px filter rail + result list fit comfortably. The hero
-  // itself still reads centered on the narrower column.
+  // Widen the page for the 3-column results layout: filters | paper
+  // results | talent rail. The hero stays centered on the narrower
+  // column visually because it's flex-centered inside the wide main.
   return (
-    <main style={{ maxWidth: 880, margin: "0 auto", padding: "0 20px" }}>
+    <main style={{ maxWidth: 1180, margin: "0 auto", padding: "0 20px" }}>
       <Nav />
 
       <div

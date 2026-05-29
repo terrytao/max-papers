@@ -51,6 +51,37 @@ interface SearchResult {
   filters: Filters;
 }
 
+// Right-rail talent matches — populated in parallel with the paper
+// search via POST /api/talent/matches with the extracted topic.
+interface MatchPosition {
+  id: string;
+  title: string;
+  type: string;
+  institution: string;
+  country: string | null;
+  funded: boolean;
+  deadline: string | null;
+  score: number;
+  postedBy: { name: string; institution: string | null } | null;
+}
+
+interface MatchCandidate {
+  id: string;
+  name: string;
+  title: string | null;
+  institution: string | null;
+  paperCount: number;
+  totalCitations: number;
+  lookingFor: string[];
+  score: number;
+  papers: Array<{ paper: { title: string; year: number | null; citationCount: number } }>;
+}
+
+interface TalentMatches {
+  positions: MatchPosition[];
+  candidates: MatchCandidate[];
+}
+
 const SUGGESTIONS = [
   "papers about robots that can feel things",
   "does coffee prevent or cause cancer?",
@@ -65,11 +96,12 @@ export function SearchExperience() {
   const [summaryLoading, setSummaryLoading] = useState(false);
   const [activeFilters, setActiveFilters] = useState<Filters | null>(null);
   const [matchMode, setMatchMode] = useState<"AND" | "OR">("AND");
+  const [talent, setTalent] = useState<TalentMatches | null>(null);
+  const [talentLoading, setTalentLoading] = useState(false);
 
-  // Used to drop a stale summary if the user fires another search
-  // before the previous summary call returns. The summary endpoint
-  // can take 1-3s; without this guard, the late response would
-  // overwrite the new query's (empty) summary.
+  // Race-guard token shared by both async tail-fetches (summary +
+  // talent) — both keyed off the same search; when a new search
+  // fires, any in-flight tail responses are dropped.
   const summaryTokenRef = useRef(0);
 
   async function search(
@@ -111,11 +143,12 @@ export function SearchExperience() {
       setActiveFilters(initial.filters);
       setLoading(false);
 
-      // Phase 2: summary. Fire and forget — UI shows a placeholder
-      // until the response lands. Race-safe via summaryTokenRef.
+      // Phase 2 (parallel): summary + talent rail. Both fire-and-forget,
+      // race-safe via summaryTokenRef.
+      const topic = initial.filters?.topic ?? q;
+
       if (initial.papers.length > 0) {
         setSummaryLoading(true);
-        const topic = initial.filters?.topic ?? q;
         const sliced = initial.papers.slice(0, 3).map((p) => ({
           title: p.title,
           abstract: p.abstract,
@@ -127,7 +160,7 @@ export function SearchExperience() {
         })
           .then((r) => r.json())
           .then((s: { summary?: string }) => {
-            if (myToken !== summaryTokenRef.current) return; // superseded
+            if (myToken !== summaryTokenRef.current) return;
             setResults((prev) =>
               prev ? { ...prev, summary: s.summary ?? "" } : prev,
             );
@@ -140,6 +173,42 @@ export function SearchExperience() {
               setSummaryLoading(false);
             }
           });
+      }
+
+      // Talent matches — fire even on zero paper results; users may
+      // still want to see jobs/candidates on the topic. Skip when
+      // topic is empty (e.g. caller passed only year filters).
+      if (topic?.trim()) {
+        setTalentLoading(true);
+        fetch("/api/talent/matches", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ topic }),
+        })
+          .then((r) => r.json())
+          .then((t: TalentMatches & { error?: string }) => {
+            if (myToken !== summaryTokenRef.current) return;
+            if (t.error) {
+              setTalent({ positions: [], candidates: [] });
+            } else {
+              setTalent({
+                positions: t.positions ?? [],
+                candidates: t.candidates ?? [],
+              });
+            }
+          })
+          .catch(() => {
+            if (myToken === summaryTokenRef.current) {
+              setTalent({ positions: [], candidates: [] });
+            }
+          })
+          .finally(() => {
+            if (myToken === summaryTokenRef.current) {
+              setTalentLoading(false);
+            }
+          });
+      } else {
+        setTalent(null);
       }
     } catch {
       setResults({ papers: [], total: 0, summary: "", filters: {} });
@@ -171,6 +240,8 @@ export function SearchExperience() {
     setResults(null);
     setQuery("");
     setMatchMode("AND");
+    setTalent(null);
+    setTalentLoading(false);
   }
 
   // Count of "real" active filters (suggestions doesn't count, falsy
@@ -258,7 +329,10 @@ export function SearchExperience() {
         <div
           style={{
             display: "grid",
-            gridTemplateColumns: "220px 1fr",
+            // 3 columns: filters | results | talent. The minmax(0,...)
+            // pattern lets long content (paper abstracts) wrap instead
+            // of forcing the grid to grow horizontally.
+            gridTemplateColumns: "200px minmax(0, 1.2fr) minmax(0, 1fr)",
             gap: 0,
             marginTop: 24,
             textAlign: "left",
@@ -459,10 +533,184 @@ export function SearchExperience() {
               </div>
             )}
           </section>
+
+          {/* Right rail: matching jobs + candidates for the topic */}
+          <TalentRail
+            talent={talent}
+            loading={talentLoading}
+            topic={results.filters?.topic ?? null}
+          />
         </div>
       )}
     </>
   );
+}
+
+function TalentRail({
+  talent,
+  loading,
+  topic,
+}: {
+  talent: TalentMatches | null;
+  loading: boolean;
+  topic: string | null;
+}) {
+  return (
+    <aside style={{ padding: "0 0 20px 20px", borderLeft: "0.5px solid #e8e0c8" }}>
+      <div
+        style={{
+          fontSize: 10,
+          fontWeight: 500,
+          letterSpacing: ".08em",
+          textTransform: "uppercase",
+          color: "#c8a84b",
+          marginBottom: 12,
+        }}
+      >
+        Talent · {topic ?? "—"}
+      </div>
+
+      <h3 style={railSectionLabel}>Open positions</h3>
+      {loading && !talent ? (
+        <p style={railPlaceholder}>Loading positions…</p>
+      ) : !talent || talent.positions.length === 0 ? (
+        <p style={railPlaceholder}>No open positions match this topic yet.</p>
+      ) : (
+        <ul style={railList}>
+          {talent.positions.map((p) => (
+            <li key={p.id} style={railItem}>
+              <a href={`/talent/positions/${p.id}`} style={railLink}>
+                <span style={railScore(p.score)}>{p.score}</span>
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <div style={railTitle}>{p.title}</div>
+                  <div style={railMeta}>
+                    {p.type.toUpperCase()} · {p.institution}
+                    {p.country ? ` · ${p.country}` : ""}
+                    {p.funded ? " · funded" : ""}
+                  </div>
+                </div>
+              </a>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <h3 style={{ ...railSectionLabel, marginTop: 22 }}>Available candidates</h3>
+      {loading && !talent ? (
+        <p style={railPlaceholder}>Loading candidates…</p>
+      ) : !talent || talent.candidates.length === 0 ? (
+        <p style={railPlaceholder}>
+          No candidates listed for this topic yet.
+        </p>
+      ) : (
+        <ul style={railList}>
+          {talent.candidates.map((c) => (
+            <li key={c.id} style={railItem}>
+              <a href={`/researchers/${c.id}`} style={railLink}>
+                <span style={railScore(c.score)}>{c.score}</span>
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <div style={railTitle}>{c.name}</div>
+                  <div style={railMeta}>
+                    {c.institution ?? "Independent"} ·{" "}
+                    {c.paperCount} papers
+                    {c.lookingFor.length > 0
+                      ? ` · ${c.lookingFor.join(", ")}`
+                      : ""}
+                  </div>
+                </div>
+              </a>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {/* Always-on CTA — works whether candidate list is empty or full. */}
+      <div
+        style={{
+          textAlign: "center",
+          padding: "10px 12px",
+          border: "0.5px dashed #e8e0c8",
+          marginTop: 16,
+          fontSize: 11,
+          color: "#666",
+          lineHeight: 1.6,
+        }}
+      >
+        Are you an author working on this topic?{" "}
+        <a
+          href="/talent?tab=profile"
+          style={{
+            color: "#c8a84b",
+            textDecoration: "none",
+            fontWeight: 500,
+          }}
+        >
+          Set your status →
+        </a>
+      </div>
+    </aside>
+  );
+}
+
+const railSectionLabel: React.CSSProperties = {
+  fontSize: 11,
+  fontWeight: 500,
+  letterSpacing: ".05em",
+  textTransform: "uppercase",
+  color: "#888",
+  margin: "0 0 10px",
+};
+const railList: React.CSSProperties = {
+  listStyle: "none",
+  padding: 0,
+  margin: 0,
+  display: "flex",
+  flexDirection: "column",
+  gap: 0,
+};
+const railItem: React.CSSProperties = {
+  padding: "10px 0",
+  borderBottom: "0.5px solid #f0ebd9",
+};
+const railLink: React.CSSProperties = {
+  display: "flex",
+  gap: 10,
+  alignItems: "flex-start",
+  textDecoration: "none",
+  color: "inherit",
+};
+const railTitle: React.CSSProperties = {
+  fontSize: 12,
+  fontWeight: 500,
+  color: "#111",
+  lineHeight: 1.4,
+};
+const railMeta: React.CSSProperties = {
+  fontSize: 11,
+  color: "#888",
+  marginTop: 2,
+};
+const railPlaceholder: React.CSSProperties = {
+  fontSize: 12,
+  color: "#aaa",
+  margin: 0,
+};
+function railScore(score: number): React.CSSProperties {
+  const color = score >= 80 ? "#3b6d11" : score >= 65 ? "#c8a84b" : "#888";
+  return {
+    fontSize: 10,
+    fontWeight: 600,
+    color: "#fff",
+    background: color,
+    minWidth: 26,
+    height: 22,
+    padding: "0 6px",
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: 2,
+    flexShrink: 0,
+  };
 }
 
 const fieldInputStyle = {

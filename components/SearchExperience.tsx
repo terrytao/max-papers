@@ -63,10 +63,16 @@ export function SearchExperience() {
   const [results, setResults] = useState<SearchResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [activeFilters, setActiveFilters] = useState<Filters | null>(null);
+  const [matchMode, setMatchMode] = useState<"AND" | "OR">("AND");
 
-  async function search(overrideFilters?: Filters, overrideQuery?: string) {
+  async function search(
+    overrideFilters?: Filters,
+    overrideQuery?: string,
+    overrideMode?: "AND" | "OR",
+  ) {
     const q = (overrideQuery ?? query).trim();
     if (!q && !overrideFilters) return;
+    const mode = overrideMode ?? matchMode;
     setLoading(true);
     try {
       const res = await fetch("/api/search", {
@@ -75,6 +81,7 @@ export function SearchExperience() {
         body: JSON.stringify({
           query: q,
           filters: overrideFilters ?? null,
+          matchMode: mode,
         }),
       });
       const data = (await res.json()) as SearchResult & { error?: string };
@@ -97,6 +104,14 @@ export function SearchExperience() {
     search(updated);
   }
 
+  function pickMatchMode(mode: "AND" | "OR") {
+    setMatchMode(mode);
+    if (activeFilters) {
+      // Re-search using current filters under the new mode.
+      search(activeFilters, undefined, mode);
+    }
+  }
+
   function pickSuggestion(s: string) {
     setQuery(s);
     search(undefined, s);
@@ -106,6 +121,7 @@ export function SearchExperience() {
     setActiveFilters(null);
     setResults(null);
     setQuery("");
+    setMatchMode("AND");
   }
 
   // Count of "real" active filters (suggestions doesn't count, falsy
@@ -323,6 +339,36 @@ export function SearchExperience() {
           </aside>
 
           <section style={{ padding: "0 0 20px 20px" }}>
+            {/* AND / OR mode toggle. AND = every filter must match
+                (precision); OR = any one filter can match (recall). */}
+            <div
+              style={{
+                display: "flex",
+                gap: 8,
+                alignItems: "center",
+                marginBottom: 14,
+              }}
+            >
+              <span style={{ fontSize: 11, color: "#888" }}>Match:</span>
+              <button
+                onClick={() => pickMatchMode("AND")}
+                style={modeButtonStyle(matchMode === "AND")}
+              >
+                AND
+              </button>
+              <button
+                onClick={() => pickMatchMode("OR")}
+                style={modeButtonStyle(matchMode === "OR")}
+              >
+                OR
+              </button>
+              <span style={{ fontSize: 11, color: "#bbb" }}>
+                {matchMode === "AND"
+                  ? "all filters must match"
+                  : "any filter can match"}
+              </span>
+            </div>
+
             {results.summary ? (
               <div
                 style={{
@@ -377,6 +423,17 @@ const fieldInputStyle = {
   boxSizing: "border-box" as const,
   background: "#fff",
 };
+
+function modeButtonStyle(active: boolean): React.CSSProperties {
+  return {
+    fontSize: 11,
+    padding: "3px 10px",
+    background: active ? "#111" : "transparent",
+    color: active ? "#fff" : "#888",
+    border: "0.5px solid #e8e0c8",
+    cursor: "pointer",
+  };
+}
 
 function FieldLabel({ label }: { label: string }) {
   return (

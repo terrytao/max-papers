@@ -24,7 +24,7 @@
 
 import type { NextRequest } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
-import type { Prisma } from "@prisma/client";
+import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 
 export const dynamic = "force-dynamic";
@@ -53,6 +53,7 @@ type Filters = {
 type SearchBody = {
   query?: string;
   filters?: Filters | null;
+  matchMode?: "AND" | "OR";
 };
 
 async function extractFilters(query: string): Promise<Filters> {
@@ -120,51 +121,75 @@ function tokenizeTopic(topic: string): string[] {
   ).slice(0, 6); // cap so a paragraph-length topic doesn't explode the query
 }
 
-// Partial author-name search via raw SQL — Prisma's `{ authors:
-// { has: ... } }` is exact-string-match against array elements, so
-// "Hinton" won't find "Geoffrey Hinton". Postgres `unnest` + ILIKE
-// does case-insensitive substring match against each author entry.
+// Flexible author-name search via raw SQL.
+//
+// Prisma's `{ authors: { has: ... } }` is exact-string match against
+// array elements, so "Hinton" won't find "Geoffrey Hinton". We use
+// Postgres `unnest(authors) ILIKE` instead — but also: if the user
+// types multiple words ("Peter Smith"), we want each word to match
+// somewhere in the same author entry, in any order. That handles
+// "Smith, Peter" and "Peter J. Smith" as well as the original
+// "Peter Smith".
+//
+// What it still misses: "Peter" matching "P. Smith". Initial-vs-
+// full-name aliasing is a name-normalization problem; substring
+// search alone can't solve it.
+//
 // Returns the matching paper ids so the main query can intersect via
-// `id: { in: ... }` and keep using its normal ordering / pagination.
+// `id: { in: ... }` and keep its normal ordering / pagination.
 async function findPapersByPartialAuthor(author: string): Promise<string[]> {
   // 2-char floor stops a stray 1-letter query from scanning everyone.
   if (author.length < 2) return [];
-  // Escape LIKE metacharacters in user input before wrapping in % .. %
-  const pattern = `%${author.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
-  const rows = await prisma.$queryRaw<Array<{ id: string }>>`
+  // Split on whitespace; drop 1-char fragments (initials etc.) so we
+  // don't AND in noise like "p." matching every author with a P.
+  const parts = author
+    .toLowerCase()
+    .split(/\s+/)
+    .map((p) => p.replace(/[.,;]/g, ""))
+    .filter((p) => p.length > 1);
+  if (parts.length === 0) return [];
+
+  // Escape LIKE metacharacters so a user-typed % / _ / \ is literal.
+  const esc = (s: string) => s.replace(/[\\%_]/g, (c) => `\\${c}`);
+  const likeClauses = parts.map(
+    (p) => Prisma.sql`a ILIKE ${`%${esc(p)}%`}`,
+  );
+  // AND every part — one author entry must contain ALL of them.
+  const conjunction = Prisma.join(likeClauses, " AND ");
+
+  const rows = await prisma.$queryRaw<Array<{ id: string }>>(Prisma.sql`
     SELECT id FROM "Paper"
     WHERE EXISTS (
-      SELECT 1 FROM unnest(authors) AS author_name
-      WHERE author_name ILIKE ${pattern}
+      SELECT 1 FROM unnest(authors) AS a
+      WHERE ${conjunction}
     )
-    LIMIT 500
-  `;
+    LIMIT 1000
+  `);
   return rows.map((r) => r.id);
 }
 
-async function buildWhere(f: Filters): Promise<Prisma.PaperWhereInput> {
-  const where: Prisma.PaperWhereInput = {};
-  const ands: Prisma.PaperWhereInput[] = [];
+async function buildConditions(f: Filters): Promise<Prisma.PaperWhereInput[]> {
+  const conds: Prisma.PaperWhereInput[] = [];
 
   const topic = f.topic?.trim();
   if (topic) {
     const tokens = tokenizeTopic(topic);
     if (tokens.length > 0) {
-      // AND across tokens (each significant word must appear somewhere),
-      // OR within each token (title OR abstract OR keywords).
-      for (const tok of tokens) {
-        ands.push({
+      // Each tokenized topic becomes one condition group: every
+      // significant word must appear somewhere (title/abstract/
+      // keywords). Wrapped in a nested AND so OR mode treats it as
+      // a single "topic matched" condition rather than exploding it.
+      conds.push({
+        AND: tokens.map((tok) => ({
           OR: [
             { title: { contains: tok, mode: "insensitive" as const } },
             { abstract: { contains: tok, mode: "insensitive" as const } },
             { keywords: { has: tok } },
           ],
-        });
-      }
+        })),
+      });
     } else {
-      // Topic was all stopwords — fall back to a literal contains so
-      // the query still does something instead of returning everything.
-      ands.push({
+      conds.push({
         OR: [
           { title: { contains: topic, mode: "insensitive" } },
           { abstract: { contains: topic, mode: "insensitive" } },
@@ -176,20 +201,32 @@ async function buildWhere(f: Filters): Promise<Prisma.PaperWhereInput> {
   const author = f.author?.trim();
   if (author) {
     const ids = await findPapersByPartialAuthor(author);
-    // Even when no author matches, push an empty `id IN ()` so the
-    // author filter genuinely scopes the query (rather than silently
-    // returning unrelated papers that match only the topic).
-    ands.push({ id: { in: ids } });
+    // Even an empty ids[] is pushed — in AND mode that correctly
+    // zeros out the result; in OR mode it's a no-op group.
+    conds.push({ id: { in: ids } });
   }
 
-  if (ands.length > 0) where.AND = ands;
   if (typeof f.afterYear === "number" && f.afterYear > 1900) {
-    where.year = { gte: f.afterYear };
+    conds.push({ year: { gte: f.afterYear } });
   }
   const journal = f.journal?.trim();
-  if (journal) where.journal = { contains: journal, mode: "insensitive" };
-  if (f.openAccess === true) where.isOpenAccess = true;
-  return where;
+  if (journal) {
+    conds.push({ journal: { contains: journal, mode: "insensitive" } });
+  }
+  if (f.openAccess === true) {
+    conds.push({ isOpenAccess: true });
+  }
+
+  return conds;
+}
+
+async function buildWhere(
+  f: Filters,
+  mode: "AND" | "OR",
+): Promise<Prisma.PaperWhereInput> {
+  const conds = await buildConditions(f);
+  if (conds.length === 0) return {};
+  return mode === "OR" ? { OR: conds } : { AND: conds };
 }
 
 async function generateSummary(
@@ -227,6 +264,7 @@ export async function POST(req: NextRequest) {
   }
 
   const query = (body.query ?? "").trim().slice(0, MAX_QUERY_CHARS);
+  const matchMode: "AND" | "OR" = body.matchMode === "OR" ? "OR" : "AND";
   let filters: Filters | null = body.filters ?? null;
 
   if (!filters && !query) {
@@ -244,7 +282,7 @@ export async function POST(req: NextRequest) {
     console.error("[search] extraction failed:", (err as Error).message);
   }
 
-  const where = await buildWhere(filters ?? { topic: query });
+  const where = await buildWhere(filters ?? { topic: query }, matchMode);
   const [papers, total] = await Promise.all([
     prisma.paper.findMany({
       where,
@@ -269,5 +307,6 @@ export async function POST(req: NextRequest) {
     total,
     summary,
     filters,
+    matchMode,
   });
 }

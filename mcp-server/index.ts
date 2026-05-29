@@ -41,7 +41,7 @@ if (!databaseUrl) {
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { PrismaClient } from "@prisma/client";
+import { Prisma, PrismaClient } from "@prisma/client";
 import { PrismaPg } from "@prisma/adapter-pg";
 
 const prisma = new PrismaClient({
@@ -54,22 +54,32 @@ const server = new McpServer({
   description: "Search the maxpaper research index in plain English",
 });
 
-// Partial author-name search via raw SQL. Prisma's `{ authors:
-// { has: ... } }` is exact-match against array elements; this does
-// case-insensitive substring match against each author entry, so
-// "Hinton" finds "Geoffrey Hinton". 2-char floor + LIMIT 500 guard
-// against pathological scans.
+// Flexible author-name search via raw SQL. Each whitespace-separated
+// word in the search term must appear somewhere in the same author
+// entry, in any order — handles "Smith, Peter", "Peter J. Smith",
+// "Peter Smith", "Smith Peter". Doesn't help "P. Smith" matching
+// "Peter" (initial-vs-full-name aliasing is a separate problem).
 async function findPapersByPartialAuthor(author: string): Promise<string[]> {
   if (author.length < 2) return [];
-  const pattern = `%${author.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
-  const rows = await prisma.$queryRaw<Array<{ id: string }>>`
+  const parts = author
+    .toLowerCase()
+    .split(/\s+/)
+    .map((p) => p.replace(/[.,;]/g, ""))
+    .filter((p) => p.length > 1);
+  if (parts.length === 0) return [];
+  const esc = (s: string) => s.replace(/[\\%_]/g, (c) => `\\${c}`);
+  const likeClauses = parts.map(
+    (p) => Prisma.sql`a ILIKE ${`%${esc(p)}%`}`,
+  );
+  const conjunction = Prisma.join(likeClauses, " AND ");
+  const rows = await prisma.$queryRaw<Array<{ id: string }>>(Prisma.sql`
     SELECT id FROM "Paper"
     WHERE EXISTS (
-      SELECT 1 FROM unnest(authors) AS author_name
-      WHERE author_name ILIKE ${pattern}
+      SELECT 1 FROM unnest(authors) AS a
+      WHERE ${conjunction}
     )
-    LIMIT 500
-  `;
+    LIMIT 1000
+  `);
   return rows.map((r) => r.id);
 }
 

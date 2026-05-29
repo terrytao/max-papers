@@ -72,14 +72,25 @@ interface MatchCandidate {
   institution: string | null;
   paperCount: number;
   totalCitations: number;
+  hIndex: number;
+  visibility: string;
   lookingFor: string[];
+  availableFrom: string | null;
   score: number;
-  papers: Array<{ paper: { title: string; year: number | null; citationCount: number } }>;
+  topPaper: {
+    title: string;
+    journal: string | null;
+    year: number | null;
+    citationCount: number;
+  } | null;
+  researchTopics: string[];
 }
 
 interface TalentMatches {
   positions: MatchPosition[];
   candidates: MatchCandidate[];
+  privateCandidateCount: number;
+  total: number;
 }
 
 const SUGGESTIONS = [
@@ -183,23 +194,28 @@ export function SearchExperience() {
         fetch("/api/talent/matches", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ topic }),
+          // topics[] form (preferred) — endpoint still accepts the
+          // singular `topic` shape too for back-compat with other
+          // callers (MCP server, future agents).
+          body: JSON.stringify({ topics: [topic] }),
         })
           .then((r) => r.json())
           .then((t: TalentMatches & { error?: string }) => {
             if (myToken !== summaryTokenRef.current) return;
             if (t.error) {
-              setTalent({ positions: [], candidates: [] });
+              setTalent({ positions: [], candidates: [], privateCandidateCount: 0, total: 0 });
             } else {
               setTalent({
                 positions: t.positions ?? [],
                 candidates: t.candidates ?? [],
+                privateCandidateCount: t.privateCandidateCount ?? 0,
+                total: t.total ?? 0,
               });
             }
           })
           .catch(() => {
             if (myToken === summaryTokenRef.current) {
-              setTalent({ positions: [], candidates: [] });
+              setTalent({ positions: [], candidates: [], privateCandidateCount: 0, total: 0 });
             }
           })
           .finally(() => {
@@ -570,61 +586,82 @@ function TalentRail({
         Talent · {topic ?? "—"}
       </div>
 
-      <h3 style={railSectionLabel}>Open positions</h3>
+      <h3 style={railSectionLabel}>
+        {talent ? `${talent.positions.length} matching positions` : "Open positions"}
+      </h3>
       {loading && !talent ? (
         <p style={railPlaceholder}>Loading positions…</p>
       ) : !talent || talent.positions.length === 0 ? (
         <p style={railPlaceholder}>No open positions match this topic yet.</p>
       ) : (
         <ul style={railList}>
-          {talent.positions.map((p) => (
-            <li key={p.id} style={railItem}>
-              <a href={`/talent/positions/${p.id}`} style={railLink}>
-                <span style={railScore(p.score)}>{p.score}</span>
-                <div style={{ minWidth: 0, flex: 1 }}>
-                  <div style={railTitle}>{p.title}</div>
-                  <div style={railMeta}>
-                    {p.type.toUpperCase()} · {p.institution}
-                    {p.country ? ` · ${p.country}` : ""}
-                    {p.funded ? " · funded" : ""}
-                  </div>
-                </div>
-              </a>
+          {talent.positions.slice(0, 3).map((p) => (
+            <li key={p.id} style={{ marginBottom: 8 }}>
+              <PositionCard p={p} />
             </li>
           ))}
         </ul>
       )}
 
-      <h3 style={{ ...railSectionLabel, marginTop: 22 }}>Available candidates</h3>
+      <h3 style={{ ...railSectionLabel, marginTop: 22 }}>
+        Candidates — openly looking
+      </h3>
       {loading && !talent ? (
         <p style={railPlaceholder}>Loading candidates…</p>
       ) : !talent || talent.candidates.length === 0 ? (
         <p style={railPlaceholder}>
-          No candidates listed for this topic yet.
+          No public candidates yet for this topic.
         </p>
       ) : (
-        <ul style={railList}>
+        <div>
           {talent.candidates.map((c) => (
-            <li key={c.id} style={railItem}>
-              <a href={`/researchers/${c.id}`} style={railLink}>
-                <span style={railScore(c.score)}>{c.score}</span>
-                <div style={{ minWidth: 0, flex: 1 }}>
-                  <div style={railTitle}>{c.name}</div>
-                  <div style={railMeta}>
-                    {c.institution ?? "Independent"} ·{" "}
-                    {c.paperCount} papers
-                    {c.lookingFor.length > 0
-                      ? ` · ${c.lookingFor.join(", ")}`
-                      : ""}
-                  </div>
-                </div>
-              </a>
-            </li>
+            <CandidateCard key={c.id} c={c} />
           ))}
-        </ul>
+        </div>
       )}
 
-      {/* Always-on CTA — works whether candidate list is empty or full. */}
+      {/* Private aggregate — count only, no PII. */}
+      {talent && talent.privateCandidateCount > 0 ? (
+        <div
+          style={{
+            border: "0.5px solid #e8e0c8",
+            padding: "12px 14px",
+            background: "#faf8f5",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 12,
+            marginBottom: 8,
+            marginTop: 8,
+          }}
+        >
+          <div>
+            <div style={{ fontSize: 13, fontWeight: 500, color: "#111" }}>
+              {talent.privateCandidateCount} more researcher
+              {talent.privateCandidateCount !== 1 ? "s" : ""}
+            </div>
+            <div style={{ fontSize: 11, color: "#666", marginTop: 2 }}>
+              publish on this topic but prefer private outreach
+            </div>
+          </div>
+          <div
+            style={{
+              fontSize: 10,
+              color: "#aaa",
+              textAlign: "right",
+              flexShrink: 0,
+              lineHeight: 1.4,
+            }}
+          >
+            Notified automatically
+            <br />
+            when strong match found
+          </div>
+        </div>
+      ) : null}
+
+      {/* Always-on CTA. Talent hub uses tabs internally, so route to
+          ?tab=profile rather than the not-yet-built /talent/apply. */}
       <div
         style={{
           textAlign: "center",
@@ -636,7 +673,7 @@ function TalentRail({
           lineHeight: 1.6,
         }}
       >
-        Are you an author working on this topic?{" "}
+        Author on this topic?{" "}
         <a
           href="/talent?tab=profile"
           style={{
@@ -649,6 +686,270 @@ function TalentRail({
         </a>
       </div>
     </aside>
+  );
+}
+
+function PositionCard({ p }: { p: MatchPosition }) {
+  const scoreColor = p.score >= 80 ? "#27500a" : "#854f0b";
+  const barColor = p.score >= 80 ? "#3b6d11" : "#854f0b";
+  return (
+    <a
+      href={`/talent/positions/${p.id}`}
+      style={{
+        display: "block",
+        textDecoration: "none",
+        border: "0.5px solid #e8e0c8",
+        padding: "10px 12px",
+        color: "inherit",
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "flex-start",
+          gap: 8,
+        }}
+      >
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 12, fontWeight: 500, color: "#111", lineHeight: 1.3 }}>
+            {p.title}
+          </div>
+          <div style={{ fontSize: 11, color: "#666", marginTop: 2 }}>
+            {(p.postedBy?.institution ?? p.postedBy?.name) ?? "—"}
+            {p.country ? ` · ${p.country}` : ""}
+          </div>
+        </div>
+        <div style={{ fontSize: 15, fontWeight: 500, color: scoreColor, flexShrink: 0 }}>
+          {p.score}%
+        </div>
+      </div>
+      <div
+        style={{
+          height: 3,
+          background: "#f0ebd9",
+          margin: "6px 0",
+        }}
+      >
+        <div style={{ width: `${p.score}%`, height: "100%", background: barColor }} />
+      </div>
+      <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+        {p.funded ? (
+          <span
+            style={{
+              fontSize: 10,
+              padding: "2px 7px",
+              background: "#eaf3de",
+              color: "#27500a",
+            }}
+          >
+            Funded
+          </span>
+        ) : null}
+        <span
+          style={{
+            fontSize: 10,
+            padding: "2px 7px",
+            background: "#faeeda",
+            color: "#633806",
+          }}
+        >
+          {p.type}
+        </span>
+        {p.deadline ? (
+          <span style={{ fontSize: 10, color: "#888" }}>
+            Due{" "}
+            {new Date(p.deadline).toLocaleDateString("en-US", {
+              month: "short",
+              day: "numeric",
+            })}
+          </span>
+        ) : null}
+      </div>
+    </a>
+  );
+}
+
+function CandidateCard({ c }: { c: MatchCandidate }) {
+  const initials = c.name
+    .split(/\s+/)
+    .map((n) => n[0] ?? "")
+    .join("")
+    .slice(0, 2)
+    .toUpperCase();
+  const scoreColor = c.score >= 80 ? "#27500a" : "#854f0b";
+  const barColor = c.score >= 80 ? "#3b6d11" : "#854f0b";
+  return (
+    <div
+      style={{
+        border: "0.5px solid #e8e0c8",
+        padding: 12,
+        marginBottom: 8,
+      }}
+    >
+      <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+        <div
+          style={{
+            width: 30,
+            height: 30,
+            borderRadius: "50%",
+            background: "#e6f1fb",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            fontSize: 10,
+            fontWeight: 500,
+            color: "#0c447c",
+            flexShrink: 0,
+          }}
+        >
+          {initials}
+        </div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "flex-start",
+              gap: 8,
+            }}
+          >
+            <div style={{ minWidth: 0 }}>
+              <div style={{ fontSize: 13, fontWeight: 500, color: "#111" }}>
+                {c.name}
+              </div>
+              <div style={{ fontSize: 11, color: "#666", marginTop: 1 }}>
+                {[c.title, c.institution].filter(Boolean).join(" · ") || "Independent"}
+              </div>
+            </div>
+            <div style={{ textAlign: "right", flexShrink: 0 }}>
+              <div style={{ fontSize: 15, fontWeight: 500, color: scoreColor }}>
+                {c.score}%
+              </div>
+              <div style={{ fontSize: 9, color: "#aaa" }}>match</div>
+            </div>
+          </div>
+
+          <div style={{ height: 3, background: "#f0ebd9", margin: "5px 0" }}>
+            <div style={{ width: `${c.score}%`, height: "100%", background: barColor }} />
+          </div>
+
+          <div style={{ display: "flex", gap: 4, marginBottom: 6, flexWrap: "wrap" }}>
+            {c.lookingFor.map((lf) => (
+              <span
+                key={lf}
+                style={{
+                  fontSize: 10,
+                  padding: "2px 7px",
+                  background: "#faeeda",
+                  color: "#633806",
+                }}
+              >
+                Seeking {lf}
+              </span>
+            ))}
+            {c.availableFrom ? (
+              <span
+                style={{
+                  fontSize: 10,
+                  padding: "2px 7px",
+                  background: "#eaf3de",
+                  color: "#27500a",
+                }}
+              >
+                Available{" "}
+                {new Date(c.availableFrom) < new Date()
+                  ? "now"
+                  : new Date(c.availableFrom).toLocaleDateString("en-US", {
+                      month: "short",
+                      year: "numeric",
+                    })}
+              </span>
+            ) : null}
+          </div>
+
+          <div
+            style={{
+              padding: "7px 10px",
+              background: "#faf8f5",
+              fontSize: 11,
+              color: "#666",
+              lineHeight: 1.6,
+              marginBottom: 6,
+            }}
+          >
+            {c.paperCount} papers · {c.totalCitations.toLocaleString("en-US")}{" "}
+            citations
+            {c.hIndex > 0 ? ` · h-index ${c.hIndex}` : ""}
+            {c.topPaper ? (
+              <>
+                <br />
+                Top:{" "}
+                <span style={{ color: "#111" }}>
+                  {c.topPaper.title.length > 60
+                    ? c.topPaper.title.slice(0, 60) + "…"
+                    : c.topPaper.title}
+                </span>
+                {c.topPaper.journal
+                  ? ` (${c.topPaper.journal}${c.topPaper.year ? ` ${c.topPaper.year}` : ""}`
+                  : ""}
+                {c.topPaper.citationCount > 0
+                  ? `${c.topPaper.journal ? ", " : " ("}${c.topPaper.citationCount} citations)`
+                  : c.topPaper.journal
+                    ? ")"
+                    : ""}
+              </>
+            ) : null}
+          </div>
+
+          {c.researchTopics.length > 0 ? (
+            <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginBottom: 8 }}>
+              {c.researchTopics.slice(0, 4).map((t) => (
+                <span
+                  key={t}
+                  style={{
+                    fontSize: 10,
+                    padding: "2px 7px",
+                    background: "#e6f1fb",
+                    color: "#0c447c",
+                  }}
+                >
+                  {t}
+                </span>
+              ))}
+            </div>
+          ) : null}
+
+          <div style={{ display: "flex", gap: 6 }}>
+            <a
+              href={`/researchers/${c.id}`}
+              style={{
+                fontSize: 11,
+                padding: "4px 12px",
+                background: "#111",
+                color: "#fff",
+                textDecoration: "none",
+              }}
+            >
+              View profile →
+            </a>
+            <a
+              href={`mailto:?subject=${encodeURIComponent("Research opportunity")}&body=${encodeURIComponent("I found your profile on max-papers.com")}`}
+              style={{
+                fontSize: 11,
+                padding: "4px 12px",
+                background: "transparent",
+                color: "#666",
+                border: "0.5px solid #e8e0c8",
+                textDecoration: "none",
+              }}
+            >
+              Contact
+            </a>
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -668,51 +969,11 @@ const railList: React.CSSProperties = {
   flexDirection: "column",
   gap: 0,
 };
-const railItem: React.CSSProperties = {
-  padding: "10px 0",
-  borderBottom: "0.5px solid #f0ebd9",
-};
-const railLink: React.CSSProperties = {
-  display: "flex",
-  gap: 10,
-  alignItems: "flex-start",
-  textDecoration: "none",
-  color: "inherit",
-};
-const railTitle: React.CSSProperties = {
-  fontSize: 12,
-  fontWeight: 500,
-  color: "#111",
-  lineHeight: 1.4,
-};
-const railMeta: React.CSSProperties = {
-  fontSize: 11,
-  color: "#888",
-  marginTop: 2,
-};
 const railPlaceholder: React.CSSProperties = {
   fontSize: 12,
   color: "#aaa",
   margin: 0,
 };
-function railScore(score: number): React.CSSProperties {
-  const color = score >= 80 ? "#3b6d11" : score >= 65 ? "#c8a84b" : "#888";
-  return {
-    fontSize: 10,
-    fontWeight: 600,
-    color: "#fff",
-    background: color,
-    minWidth: 26,
-    height: 22,
-    padding: "0 6px",
-    display: "inline-flex",
-    alignItems: "center",
-    justifyContent: "center",
-    borderRadius: 2,
-    flexShrink: 0,
-  };
-}
-
 const fieldInputStyle = {
   width: "100%",
   padding: "6px 8px",

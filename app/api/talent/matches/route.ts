@@ -46,133 +46,175 @@ export async function GET(req: NextRequest) {
   return Response.json({ count: matches.length, results: matches });
 }
 
-// POST { topic } — return open positions and available candidates
-// matching the topic. Designed for the homepage right-rail; called
-// in parallel with /api/search so the user sees jobs/candidates
-// surface alongside paper results.
+// POST — return positions + PUBLIC candidates with full detail +
+// PRIVATE candidate aggregate count. Body accepts `topics: string[]`
+// (preferred) or `topic: string` (back-compat with the v1 shape).
 //
-// Performance notes:
-//   • Positions table is small (~tens-hundreds). Filtering is
-//     cheap; OR across topics + title + description is fine.
-//   • Candidates query goes through ProfilePaper → Paper. The
-//     spec's title-contains predicate would seq-scan 2M+ rows;
-//     dropped in favor of fields[]/keywords[] array-has which
-//     hits the existing GIN indexes. That's the signal that
-//     actually matters anyway (a paper's topic tags > whether
-//     the user's typed-word appears verbatim in the title).
+// Visibility split:
+//   • visibility = "public" | "open" → row appears in `candidates`
+//     with name, institution, top papers, contact-ready actions
+//   • visibility = "private"          → counted only; nothing about
+//     the row is exposed beyond "N candidates publish on this topic"
+//   The default is "private" (set on the schema), so newly-created
+//   profiles aren't auto-leaked. Users opt-in to being visible.
+//
+// Performance notes carried from v1:
+//   • Positions table is small; OR across researchTopics +
+//     description-contains is fine
+//   • Candidate query goes through ProfilePaper → Paper. Uses
+//     fields[]/keywords[] hasSome (GIN-indexed) NOT title-contains
+//     (would seq-scan 2M+ rows). Same fix as v1.
 export async function POST(req: NextRequest) {
-  let body: { topic?: string };
+  let body: { topic?: string; topics?: string[] };
   try {
-    body = (await req.json()) as { topic?: string };
+    body = (await req.json()) as { topic?: string; topics?: string[] };
   } catch {
     return Response.json({ error: "Invalid JSON body" }, { status: 400 });
   }
-  const topic = (body.topic ?? "").trim().slice(0, 200);
-  if (!topic) {
-    return Response.json({ positions: [], candidates: [] });
-  }
-  const topicLower = topic.toLowerCase();
+  const topicList = (
+    Array.isArray(body.topics) ? body.topics : body.topic ? [body.topic] : []
+  )
+    .map((t) => String(t ?? "").trim())
+    .filter((t) => t.length > 0 && t.length <= 200)
+    .slice(0, 8);
 
-  // Positions matching the topic — open status, OR across
-  // researchTopics array-has, title/description contains.
+  if (topicList.length === 0) {
+    return Response.json({
+      positions: [],
+      candidates: [],
+      privateCandidateCount: 0,
+      total: 0,
+    });
+  }
+  const topicsLower = topicList.map((t) => t.toLowerCase());
+
+  // Shared paper-filter used by both candidate queries.
+  const paperSomeWhere = {
+    some: {
+      paper: {
+        OR: [
+          { fields: { hasSome: topicList } },
+          { keywords: { hasSome: topicsLower } },
+        ],
+      },
+    },
+  };
+
   const positionsP = prisma.position.findMany({
     where: {
       status: "open",
       OR: [
-        { researchTopics: { hasSome: [topic] } },
-        { title: { contains: topic, mode: "insensitive" } },
-        { description: { contains: topic, mode: "insensitive" } },
+        { researchTopics: { hasSome: topicList } },
+        ...topicList.map((t) => ({
+          description: { contains: t, mode: "insensitive" as const },
+        })),
       ],
     },
     take: 5,
     orderBy: [{ createdAt: "desc" }],
     include: {
-      postedBy: {
-        select: { id: true, name: true, institution: true },
-      },
+      postedBy: { select: { id: true, name: true, institution: true } },
     },
   });
 
-  // Candidates: researchers who are lookingFor SOMETHING and have
-  // at least one paper tagged with this topic (via Paper.fields[]
-  // or Paper.keywords[] — both array-has, both GIN-indexable).
-  const candidatesP = prisma.researchProfile.findMany({
+  // Public candidates — full detail.
+  const publicCandidatesP = prisma.researchProfile.findMany({
     where: {
+      visibility: { in: ["public", "open"] },
       lookingFor: { isEmpty: false },
-      papers: {
-        some: {
-          paper: {
-            OR: [
-              { fields: { has: topic } },
-              { keywords: { has: topicLower } },
-            ],
-          },
-        },
-      },
+      papers: paperSomeWhere,
     },
     take: 5,
+    orderBy: [{ totalCitations: "desc" }, { paperCount: "desc" }],
     include: {
       papers: {
         include: {
           paper: {
             select: {
+              id: true,
               title: true,
-              citationCount: true,
+              journal: true,
               year: true,
+              citationCount: true,
+              keywords: true,
+              fields: true,
             },
           },
         },
         orderBy: { paper: { citationCount: "desc" } },
-        take: 1,
+        take: 3,
       },
     },
   });
 
-  const [positions, candidates] = await Promise.all([positionsP, candidatesP]);
+  // Private candidates — count only; never expose row data.
+  const privateCountP = prisma.researchProfile.count({
+    where: {
+      visibility: "private",
+      lookingFor: { isEmpty: false },
+      papers: paperSomeWhere,
+    },
+  });
 
-  // Heuristic scores so the panels can rank instead of newest-first.
-  const scoredPositions = positions
-    .map((p) => ({
-      ...p,
-      score: scorePosition(p, topic),
-    }))
+  const [positions, publicCandidates, privateCandidateCount] = await Promise.all(
+    [positionsP, publicCandidatesP, privateCountP],
+  );
+
+  const scoredCandidates = publicCandidates
+    .map((c) => {
+      const candidateTopics = c.papers.flatMap((pp) => [
+        ...pp.paper.keywords,
+        ...pp.paper.fields,
+      ]);
+      const overlap = topicList.filter((t) =>
+        candidateTopics.some((ct) => ct.toLowerCase().includes(t.toLowerCase())),
+      ).length;
+      const citationBonus = Math.min(20, c.totalCitations / 100);
+      const score = Math.min(99, 50 + overlap * 15 + citationBonus);
+      const topPaper = c.papers[0]?.paper ?? null;
+      const researchTopics = Array.from(new Set(candidateTopics)).slice(0, 4);
+      return {
+        id: c.id,
+        name: c.name,
+        institution: c.institution,
+        title: c.title,
+        lookingFor: c.lookingFor,
+        availableFrom: c.availableFrom,
+        paperCount: c.paperCount,
+        totalCitations: c.totalCitations,
+        hIndex: c.hIndex,
+        visibility: c.visibility,
+        topPaper: topPaper
+          ? {
+              title: topPaper.title,
+              journal: topPaper.journal,
+              year: topPaper.year,
+              citationCount: topPaper.citationCount,
+            }
+          : null,
+        researchTopics,
+        score: Math.round(score),
+      };
+    })
     .sort((a, b) => b.score - a.score);
 
-  const scoredCandidates = candidates
-    .map((c) => ({
-      ...c,
-      score: scoreCandidate(c),
-    }))
+  const scoredPositions = positions
+    .map((p) => {
+      const overlap = topicList.filter(
+        (t) =>
+          p.researchTopics.some((rt) =>
+            rt.toLowerCase().includes(t.toLowerCase()),
+          ) || p.description.toLowerCase().includes(t.toLowerCase()),
+      ).length;
+      const score = Math.min(99, 50 + overlap * 20 + (p.funded ? 5 : 0));
+      return { ...p, score: Math.round(score) };
+    })
     .sort((a, b) => b.score - a.score);
 
   return Response.json({
     positions: scoredPositions,
     candidates: scoredCandidates,
+    privateCandidateCount,
+    total: scoredCandidates.length + privateCandidateCount,
   });
-}
-
-function scorePosition(
-  p: {
-    researchTopics: string[];
-    title: string;
-    funded: boolean;
-  },
-  topic: string,
-): number {
-  let score = 50;
-  if (p.researchTopics.includes(topic)) score += 30;
-  if (p.title.toLowerCase().includes(topic.toLowerCase())) score += 15;
-  if (p.funded) score += 5;
-  return Math.min(score, 99);
-}
-
-function scoreCandidate(c: {
-  papers: Array<{ paper: { citationCount: number } }>;
-}): number {
-  let score = 50;
-  const top = c.papers[0]?.paper;
-  if (top && top.citationCount > 100) score += 20;
-  if (top && top.citationCount > 500) score += 15;
-  if (c.papers.length > 5) score += 10;
-  return Math.min(score, 99);
 }

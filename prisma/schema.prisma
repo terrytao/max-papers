@@ -122,6 +122,13 @@ model ResearchProfile {
   // "industry-job". Driving filter chips on the talent hub.
   lookingFor      String[]
   availableFrom   DateTime?
+  // Public discovery mode. Defaults to "private" so creating a
+  // profile doesn't auto-expose name/employer; users opt in to
+  // appearing on the homepage talent rail. Values:
+  //   "private"  → counted in aggregate, name not shown
+  //   "public"   → full profile rendered with contact links
+  //   "open"     → public + signals "actively seeking now"
+  visibility      String         @default("private")
   // Self-declared topic + method interests beyond what their papers
   // already imply. Used by the matching engine as a weak signal
   // when the publication footprint is small.

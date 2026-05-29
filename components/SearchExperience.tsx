@@ -444,8 +444,6 @@ function FilterField({
 }
 
 function PaperRow({ paper }: { paper: Paper }) {
-  const target =
-    paper.url ?? `/papers/${paper.id}`;
   return (
     <div
       style={{ padding: "14px 0", borderBottom: "0.5px solid #e8e0c8" }}
@@ -490,9 +488,7 @@ function PaperRow({ paper }: { paper: Paper }) {
         </span>
       </div>
       <a
-        href={target}
-        target={paper.url ? "_blank" : undefined}
-        rel={paper.url ? "noopener noreferrer" : undefined}
+        href={`/papers/${paper.id}`}
         style={{
           fontSize: 14,
           fontWeight: 500,

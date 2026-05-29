@@ -61,7 +61,12 @@ export default async function BrowsePage() {
                     lineHeight: 1.35,
                   }}
                 >
-                  {p.title}
+                  <a
+                    href={`/papers/${p.id}`}
+                    style={{ color: "inherit", textDecoration: "none" }}
+                  >
+                    {p.title}
+                  </a>
                 </h3>
                 <p
                   style={{

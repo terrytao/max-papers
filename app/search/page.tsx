@@ -134,10 +134,6 @@ function PaperRow({ paper: p }: { paper: PaperPreview }) {
   const moreAuthors = p.authors.length > 4 ? ` + ${p.authors.length - 4} more` : "";
   const abstract =
     p.abstract.length > 280 ? p.abstract.slice(0, 280) + "…" : p.abstract;
-  const target =
-    p.url ??
-    (p.arxivId ? `https://arxiv.org/abs/${p.arxivId}` : null) ??
-    (p.doi ? `https://doi.org/${p.doi}` : null);
   return (
     <li
       style={{
@@ -146,18 +142,12 @@ function PaperRow({ paper: p }: { paper: PaperPreview }) {
       }}
     >
       <h3 style={{ fontSize: 14, fontWeight: 500, color: "#111", margin: 0, lineHeight: 1.35 }}>
-        {target ? (
-          <a
-            href={target}
-            target="_blank"
-            rel="noopener noreferrer"
-            style={{ color: "inherit", textDecoration: "none" }}
-          >
-            {p.title}
-          </a>
-        ) : (
-          p.title
-        )}
+        <a
+          href={`/papers/${p.id}`}
+          style={{ color: "inherit", textDecoration: "none" }}
+        >
+          {p.title}
+        </a>
       </h3>
       <p style={{ fontSize: 12, color: "#888", margin: "6px 0 0" }}>
         {authors}

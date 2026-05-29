@@ -103,10 +103,20 @@ export async function POST(req: NextRequest) {
   const positionsP = prisma.position.findMany({
     where: {
       status: "open",
+      // Widened so institution/title hits surface too — without
+      // these, an institution like "DeepMind" wouldn't match any
+      // position even when a Position.institution = "DeepMind"
+      // existed in the DB.
       OR: [
         { researchTopics: { hasSome: topicList } },
         ...topicList.map((t) => ({
           description: { contains: t, mode: "insensitive" as const },
+        })),
+        ...topicList.map((t) => ({
+          institution: { contains: t, mode: "insensitive" as const },
+        })),
+        ...topicList.map((t) => ({
+          title: { contains: t, mode: "insensitive" as const },
         })),
       ],
     },
@@ -200,12 +210,15 @@ export async function POST(req: NextRequest) {
 
   const scoredPositions = positions
     .map((p) => {
-      const overlap = topicList.filter(
-        (t) =>
-          p.researchTopics.some((rt) =>
-            rt.toLowerCase().includes(t.toLowerCase()),
-          ) || p.description.toLowerCase().includes(t.toLowerCase()),
-      ).length;
+      const overlap = topicList.filter((t) => {
+        const lt = t.toLowerCase();
+        return (
+          p.researchTopics.some((rt) => rt.toLowerCase().includes(lt)) ||
+          p.description.toLowerCase().includes(lt) ||
+          (p.institution ?? "").toLowerCase().includes(lt) ||
+          p.title.toLowerCase().includes(lt)
+        );
+      }).length;
       const score = Math.min(99, 50 + overlap * 20 + (p.funded ? 5 : 0));
       return { ...p, score: Math.round(score) };
     })

@@ -63,6 +63,8 @@ interface MatchPosition {
   deadline: string | null;
   score: number;
   postedBy: { name: string; institution: string | null } | null;
+  source: string | null;
+  sourceUrl: string | null;
 }
 
 interface MatchCandidate {
@@ -737,6 +739,10 @@ function PositionCard({ p }: { p: MatchPosition }) {
   const [applying, setApplying] = useState(false);
   const scoreColor = p.score >= 80 ? "#27500a" : "#854f0b";
   const barColor = p.score >= 80 ? "#3b6d11" : "#854f0b";
+  const isCrawled = p.source === "crawled";
+  const provenance = isCrawled
+    ? `via ${p.institution ?? "external"} careers`
+    : `Posted by ${p.postedBy?.name ?? "a researcher"}`;
   return (
     <div
       style={{
@@ -770,6 +776,9 @@ function PositionCard({ p }: { p: MatchPosition }) {
           <div style={{ fontSize: 11, color: "#666", marginTop: 2 }}>
             {(p.postedBy?.institution ?? p.postedBy?.name) ?? "—"}
             {p.country ? ` · ${p.country}` : ""}
+          </div>
+          <div style={{ fontSize: 10, color: "#888", marginTop: 2 }}>
+            {provenance}
           </div>
         </div>
         <div style={{ fontSize: 15, fontWeight: 500, color: scoreColor, flexShrink: 0 }}>
@@ -824,23 +833,42 @@ function PositionCard({ p }: { p: MatchPosition }) {
             })}
           </span>
         ) : null}
-        <button
-          type="button"
-          onClick={() => setApplying((v) => !v)}
-          style={{
-            marginLeft: "auto",
-            fontSize: 10,
-            padding: "3px 10px",
-            background: applying ? "transparent" : "#111",
-            color: applying ? "#666" : "#fff",
-            border: applying ? "0.5px solid #e8e0c8" : "0.5px solid #111",
-            cursor: "pointer",
-          }}
-        >
-          {applying ? "Close" : "Apply privately"}
-        </button>
+        {isCrawled ? (
+          <a
+            href={p.sourceUrl ?? "#"}
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{
+              marginLeft: "auto",
+              fontSize: 10,
+              padding: "3px 10px",
+              background: "transparent",
+              color: "#666",
+              border: "0.5px solid #e8e0c8",
+              textDecoration: "none",
+            }}
+          >
+            Apply on {p.institution ?? "source"} →
+          </a>
+        ) : (
+          <button
+            type="button"
+            onClick={() => setApplying((v) => !v)}
+            style={{
+              marginLeft: "auto",
+              fontSize: 10,
+              padding: "3px 10px",
+              background: applying ? "transparent" : "#111",
+              color: applying ? "#666" : "#fff",
+              border: applying ? "0.5px solid #e8e0c8" : "0.5px solid #111",
+              cursor: "pointer",
+            }}
+          >
+            {applying ? "Close" : "Apply privately"}
+          </button>
+        )}
       </div>
-      {applying ? <QuickApplyForm positionId={p.id} /> : null}
+      {applying && !isCrawled ? <QuickApplyForm positionId={p.id} /> : null}
     </div>
   );
 }

@@ -898,6 +898,134 @@ server.tool(
   },
 );
 
+// ── search_positions ───────────────────────────────────────────────
+// Free-text search across title / institution / description /
+// researchTopics. Case- and space-insensitive — "deep mind" matches
+// "DeepMind". The same logic lives in lib/talent/search.ts (used by
+// the REST route); inlined here because mcp-server's tsconfig has
+// rootDir=./ and the Claude Desktop config points at dist/index.js,
+// so reaching out to ../lib breaks the build path. Two ~80-line
+// copies is a smaller cost than touching the deployed config.
+
+function searchNormalize(s: string | null | undefined): string {
+  return (s ?? "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+function searchTokenize(q: string | null | undefined): string[] {
+  return (q ?? "").trim().toLowerCase().split(/\s+/).filter(Boolean);
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function scoreSearchPosition(p: Record<string, any>, q: string): number {
+  let s = 0;
+  if (p.source === "manual") s += 8;
+  if (p.funded) s += 3;
+  const created = p.createdAt ? new Date(p.createdAt).getTime() : 0;
+  const ageDays = created ? (Date.now() - created) / 86_400_000 : 999;
+  s += Math.max(0, 6 - ageDays / 30);
+  if (!q) return s;
+  const nq = searchNormalize(q);
+  const fields = {
+    title: searchNormalize(p.title),
+    institution: searchNormalize(p.institution),
+    topics: searchNormalize((p.researchTopics ?? []).join(" ")),
+    description: searchNormalize(p.description),
+  };
+  if (nq) {
+    if (fields.title.includes(nq)) s += 60;
+    else if (fields.institution.includes(nq)) s += 45;
+    else if (fields.topics.includes(nq)) s += 30;
+    else if (fields.description.includes(nq)) s += 18;
+  }
+  const weights: Array<[keyof typeof fields, number]> = [
+    ["title", 12], ["institution", 8], ["topics", 6], ["description", 3],
+  ];
+  for (const tok of searchTokenize(q)) {
+    const nt = searchNormalize(tok);
+    if (!nt) continue;
+    for (const [k, w] of weights) {
+      if (fields[k].includes(nt)) { s += w; break; }
+    }
+  }
+  return s;
+}
+
+server.tool(
+  "search_positions",
+  "Search research positions by free text. Case- and spacing-insensitive: 'deep mind' matches 'DeepMind'. Searches title, institution, description and topics.",
+  {
+    query: z.string(),
+    type: z.string().optional(),
+    country: z.string().optional(),
+    funded: z.boolean().optional(),
+    limit: z.number().optional().default(10),
+  },
+  async ({ query, type, country, funded, limit }) => {
+    const cap = Math.min(limit ?? 10, 25);
+    const tokens = searchTokenize(query);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const where: any = { status: "open" };
+    if (type) where.type = type;
+    if (country) where.country = { contains: country, mode: "insensitive" };
+    if (funded !== undefined) where.funded = funded;
+    if (tokens.length > 0) {
+      where.AND = tokens.map((t) => ({
+        OR: [
+          { title: { contains: t, mode: "insensitive" } },
+          { institution: { contains: t, mode: "insensitive" } },
+          { description: { contains: t, mode: "insensitive" } },
+        ],
+      }));
+    }
+    const candidates = await prisma.position.findMany({
+      where,
+      take: Math.min(cap * 5, 200),
+      orderBy: { createdAt: "desc" },
+      include: { postedBy: { select: { id: true, name: true, institution: true } } },
+    });
+    const positions = candidates
+      .map((p) => ({
+        p,
+        score: scoreSearchPosition(
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          p as unknown as Record<string, any>,
+          query,
+        ),
+      }))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, cap)
+      .map((x) => x.p);
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              count: positions.length,
+              source: "max-papers.com/talent",
+              results: positions.map((p) => ({
+                title: p.title,
+                type: p.type,
+                institution: p.institution,
+                country: p.country,
+                funded: p.funded,
+                deadline: p.deadline,
+                topics: p.researchTopics,
+                provenance: p.source,
+                applyUrl:
+                  p.source === "crawled"
+                    ? p.sourceUrl
+                    : `https://www.max-papers.com/talent/positions/${p.id}`,
+              })),
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  },
+);
+
 const transport = new StdioServerTransport();
 await server.connect(transport);
 console.error("max-papers MCP server running (stdio)");

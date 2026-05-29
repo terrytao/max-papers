@@ -46,7 +46,7 @@ export async function POST(req: NextRequest) {
 
   const position = await prisma.position.findUnique({
     where: { id: positionId },
-    select: { id: true, status: true },
+    select: { id: true, status: true, source: true, sourceUrl: true },
   });
   if (!position) {
     return Response.json({ error: "Position not found" }, { status: 404 });
@@ -55,6 +55,19 @@ export async function POST(req: NextRequest) {
     return Response.json(
       { error: "Position is not open for applications" },
       { status: 400 },
+    );
+  }
+  // Crawled positions have no employer on our side to receive an
+  // application — refuse here and surface the source URL so the
+  // caller can redirect the user to the original posting.
+  if (position.source === "crawled") {
+    return Response.json(
+      {
+        error:
+          "This position was aggregated from another site. Apply at the original posting.",
+        applyAt: position.sourceUrl ?? null,
+      },
+      { status: 409 },
     );
   }
 

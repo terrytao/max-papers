@@ -7,18 +7,37 @@
 import type { NextRequest } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { matchPosition } from "@/lib/matching/engine";
+import { searchPositions } from "@/lib/talent/search";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 export async function GET(req: NextRequest) {
   const sp = req.nextUrl.searchParams;
+  const q = sp.get("q");
   const topic = sp.get("topic");
   const type = sp.get("type");
   const institution = sp.get("institution");
   const country = sp.get("country");
   const funded = sp.get("funded");
   const limit = Math.min(Number(sp.get("limit") ?? 50), 100);
+
+  // Free-text branch: case- and space-insensitive search across
+  // title / institution / description / topics. Goes through the
+  // shared lib/talent/search.ts so "deep mind" and "DeepMind" hit
+  // the same row. When `q` is absent we keep the original
+  // structured-filter path unchanged.
+  if (q && q.trim()) {
+    const results = await searchPositions({
+      q,
+      type: type ?? undefined,
+      institution: institution ?? undefined,
+      country: country ?? undefined,
+      funded: funded === "true" ? true : undefined,
+      limit,
+    });
+    return Response.json({ count: results.length, results });
+  }
 
   const where: Record<string, unknown> = { status: "open" };
   if (type) where.type = type;

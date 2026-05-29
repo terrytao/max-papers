@@ -322,3 +322,21 @@ model PaperInstitute {
   @@id([paperId, instituteId])
   @@index([instituteId])
 }
+
+// ──────────────────────────────────────────────────────────────────
+// Search cache — layer 2 of the search route's 3-layer cache stack
+// (in-memory → SearchCache → live FTS). queryHash is an md5 of
+// {query, filters, matchMode}; @unique gives us upsert-on-hash.
+// expiresAt indexed so the cleanup cron can prune fast.
+
+model SearchCache {
+  id        String   @id @default(cuid())
+  queryHash String   @unique
+  query     String
+  results   Json
+  hitCount  Int      @default(1)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([expiresAt])
+}

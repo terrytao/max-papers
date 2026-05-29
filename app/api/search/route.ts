@@ -26,6 +26,7 @@
 //   • cache entries cap 500, TTL 1h
 //   • 60s wall-clock via maxDuration
 
+import { createHash } from "node:crypto";
 import type { NextRequest } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
 import { Prisma } from "@prisma/client";
@@ -39,6 +40,24 @@ const MODEL = "claude-haiku-4-5-20251001";
 const MAX_QUERY_CHARS = 500;
 const CACHE_MAX = 500;
 const CACHE_TTL_MS = 60 * 60 * 1000;
+
+// 3-layer cache config. Memory TTL shorter than DB TTL — memory is
+// the hot tier (a single process), DB is the warm tier (shared across
+// dev server restarts and future replicas). Both keep the same 5-min
+// staleness budget; memory's lower TTL just means we re-validate
+// against the DB layer faster.
+const RESULT_MEM_TTL_MS = 5 * 60 * 1000;
+const RESULT_DB_TTL_MS = 5 * 60 * 1000;
+const RESULT_MEM_MAX = 500;
+
+type CachedSearch = {
+  papers: unknown[];
+  total: number;
+  filters: unknown;
+  matchMode: string;
+};
+type ResultMemEntry = { data: CachedSearch; expires: number };
+const resultMemCache = new Map<string, ResultMemEntry>();
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -340,27 +359,43 @@ function isSimpleQuery(query: string): boolean {
   return true;
 }
 
-// ── Handler ──────────────────────────────────────────────────────────
-export async function POST(req: NextRequest) {
-  let body: SearchBody;
-  try {
-    body = (await req.json()) as SearchBody;
-  } catch {
-    return Response.json({ error: "Invalid JSON body" }, { status: 400 });
+// ── Cache helpers ────────────────────────────────────────────────────
+// Normalize the filter object before hashing so {topic, author} and
+// {author, topic} produce the same key. We don't strip null fields —
+// caller supplying explicit nulls means "no filter" and should match
+// a key built without those fields, so undefined and null collapse.
+function stableJSON(obj: unknown): string {
+  if (obj === null || obj === undefined) return "null";
+  if (typeof obj !== "object") return JSON.stringify(obj);
+  if (Array.isArray(obj)) return `[${obj.map(stableJSON).join(",")}]`;
+  const entries = Object.entries(obj as Record<string, unknown>)
+    .filter(([, v]) => v !== undefined && v !== null)
+    .sort(([a], [b]) => a.localeCompare(b));
+  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableJSON(v)}`).join(",")}}`;
+}
+
+function makeCacheKey(query: string, filters: unknown, matchMode: string): string {
+  return createHash("md5")
+    .update(stableJSON({ query, filters, matchMode }))
+    .digest("hex");
+}
+
+function memCacheSet(key: string, data: CachedSearch): void {
+  if (resultMemCache.size >= RESULT_MEM_MAX) {
+    const oldest = resultMemCache.keys().next().value;
+    if (oldest !== undefined) resultMemCache.delete(oldest);
   }
+  resultMemCache.set(key, { data, expires: Date.now() + RESULT_MEM_TTL_MS });
+}
 
-  const query = (body.query ?? "").trim().slice(0, MAX_QUERY_CHARS);
-  const matchMode: "AND" | "OR" = body.matchMode === "OR" ? "OR" : "AND";
-  let filters: Filters | null = body.filters ?? null;
-
-  if (!filters && !query) {
-    return Response.json({ error: "query or filters required" }, { status: 400 });
-  }
-
-  // Filter resolution priority:
-  //   1. Caller-supplied filters (filter-panel re-search) → use as-is
-  //   2. Simple query → skip AI extraction, search with topic=query
-  //   3. Complex query → extract via Claude (cached)
+// Wraps the existing pipeline in one function so the cache layers can
+// memoize a single call boundary.
+async function runSearch(
+  query: string,
+  bodyFilters: Filters | null,
+  matchMode: "AND" | "OR",
+): Promise<CachedSearch> {
+  let filters: Filters | null = bodyFilters;
   if (!filters && query) {
     if (isSimpleQuery(query)) {
       filters = { topic: query };
@@ -374,16 +409,115 @@ export async function POST(req: NextRequest) {
     }
   }
   filters = filters ?? { topic: query };
-
   const papers = await searchPapers(filters, matchMode);
-
-  // No summary here — that's now /api/search/summary, called by the
-  // frontend after results render. Speed-over-completeness UX:
-  // user sees papers in <1s, summary fades in a few hundred ms later.
-  return Response.json({
+  return {
     papers,
     total: papers.length,
     filters,
     matchMode,
+  };
+}
+
+// ── Handler ──────────────────────────────────────────────────────────
+export async function POST(req: NextRequest) {
+  let body: SearchBody;
+  try {
+    body = (await req.json()) as SearchBody;
+  } catch {
+    return Response.json({ error: "Invalid JSON body" }, { status: 400 });
+  }
+
+  const query = (body.query ?? "").trim().slice(0, MAX_QUERY_CHARS);
+  const matchMode: "AND" | "OR" = body.matchMode === "OR" ? "OR" : "AND";
+  const bodyFilters: Filters | null = body.filters ?? null;
+
+  if (!bodyFilters && !query) {
+    return Response.json({ error: "query or filters required" }, { status: 400 });
+  }
+
+  const cacheKey = makeCacheKey(query, bodyFilters, matchMode);
+
+  // ── L1: in-process memory (sub-ms hit) ─────────────────────────────
+  const mem = resultMemCache.get(cacheKey);
+  if (mem && mem.expires > Date.now()) {
+    return jsonWithCache({ ...mem.data, cache: "memory" });
+  }
+
+  // ── L2: shared DB cache (~10-30ms hit) ─────────────────────────────
+  try {
+    const dbHit = await prisma.searchCache.findFirst({
+      where: { queryHash: cacheKey, expiresAt: { gt: new Date() } },
+      select: { id: true, results: true },
+    });
+    if (dbHit) {
+      const data = dbHit.results as unknown as CachedSearch;
+      memCacheSet(cacheKey, data);
+      // Increment hit count fire-and-forget — never block the response
+      prisma.searchCache
+        .update({ where: { id: dbHit.id }, data: { hitCount: { increment: 1 } } })
+        .catch((err) => {
+          console.error("[search] hitCount update failed:", err.message);
+        });
+      return jsonWithCache({ ...data, cache: "db" });
+    }
+  } catch (err) {
+    // Don't fail the request on cache lookup failure — fall through
+    // to live search.
+    console.error("[search] L2 lookup failed:", (err as Error).message);
+  }
+
+  // ── L3: live search ────────────────────────────────────────────────
+  const result = await runSearch(query, bodyFilters, matchMode);
+
+  // Save to both cache layers. DB write is fire-and-forget so we don't
+  // pay write latency on the response path.
+  memCacheSet(cacheKey, result);
+  const expiresAt = new Date(Date.now() + RESULT_DB_TTL_MS);
+  prisma.searchCache
+    .upsert({
+      where: { queryHash: cacheKey },
+      create: {
+        queryHash: cacheKey,
+        query: query.slice(0, MAX_QUERY_CHARS),
+        results: result as unknown as Prisma.InputJsonValue,
+        expiresAt,
+      },
+      update: {
+        results: result as unknown as Prisma.InputJsonValue,
+        expiresAt,
+        hitCount: { increment: 1 },
+      },
+    })
+    .catch((err) => {
+      console.error("[search] L2 write failed:", err.message);
+    });
+
+  return jsonWithCache({ ...result, cache: "miss" });
+}
+
+// Build a Response with the Cache-Control header set. CDNs and
+// reverse proxies (Cloudflare, Amplify edge) will cache the same
+// payload for 5 min; stale-while-revalidate gives 60s of "serve
+// stale while we re-fetch in background" smoothness.
+function jsonWithCache(body: unknown): Response {
+  const res = Response.json(body);
+  res.headers.set(
+    "Cache-Control",
+    "public, s-maxage=300, stale-while-revalidate=60",
+  );
+  return res;
+}
+
+// Admin / cron-triggered cleanup. Gated by CRON_SECRET in env —
+// open in dev (env unset) but locked in prod once the secret is
+// configured. Without this, anyone could DoS by repeatedly purging.
+export async function DELETE(req: NextRequest) {
+  const secret = process.env.CRON_SECRET;
+  if (secret && req.nextUrl.searchParams.get("secret") !== secret) {
+    return Response.json({ error: "unauthorized" }, { status: 401 });
+  }
+  const deleted = await prisma.searchCache.deleteMany({
+    where: { expiresAt: { lt: new Date() } },
   });
+  return Response.json({ deleted: deleted.count });
 }

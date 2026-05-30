@@ -197,17 +197,18 @@ async function searchByAuthor(author: string): Promise<Set<string>> {
     .filter((p) => p.length > 1);
   if (parts.length === 0) return new Set();
   const esc = (s: string) => s.replace(/[\\%_]/g, (c) => `\\${c}`);
+  // ILIKE on paper_authors_text(authors) — our IMMUTABLE SQL wrapper
+  // around array_to_string. Routes both reads and the trigram index
+  // (Paper_authors_trgm_idx) through the same expression so the
+  // planner picks the index. The old unnest EXISTS form couldn't be
+  // index-backed at 6M rows.
+  const joined = Prisma.sql`paper_authors_text(authors)`;
   const likeClauses = parts.map(
-    (p) => Prisma.sql`a ILIKE ${`%${esc(p)}%`}`,
+    (p) => Prisma.sql`${joined} ILIKE ${`%${esc(p)}%`}`,
   );
   const conjunction = Prisma.join(likeClauses, " AND ");
   const rows = await prisma.$queryRaw<Array<{ id: string }>>(Prisma.sql`
-    SELECT id FROM "Paper"
-    WHERE EXISTS (
-      SELECT 1 FROM unnest(authors) AS a
-      WHERE ${conjunction}
-    )
-    LIMIT 500
+    SELECT id FROM "Paper" WHERE ${conjunction} LIMIT 500
   `);
   return new Set(rows.map((r) => r.id));
 }
@@ -249,46 +250,50 @@ async function searchPapers(
       : Prisma.empty;
 
     try {
+      // Three-step CTE pipeline:
+      //   fts   — pure FTS scan on the indexed search_vector. OFFSET 0
+      //           is a planner barrier: without it Postgres tries to
+      //           walk Paper_citationCount_idx backward to satisfy the
+      //           outer ORDER BY and re-filters by FTS, scanning ~100k
+      //           rows for a common term (measured 63s for "parkinson"
+      //           on 6M rows). With OFFSET 0 the GIN index drives, FTS
+      //           selectivity narrows the candidate set fast.
+      //   hits  — citation-cap to ≤300 from FTS matches.
+      //   outer — re-rank by ts_rank on the stored vector.
       papers = await prisma.$queryRaw<PaperRow[]>(Prisma.sql`
-        SELECT
-          id, title, authors, year, journal, abstract,
-          "isOpenAccess", "citationCount", "pdfUrl", url, fields
-        FROM "Paper"
-        WHERE to_tsvector('english',
-                coalesce(title, '') || ' ' || coalesce(abstract, ''))
-              @@ to_tsquery('english', ${tsQuery})
-          ${yearClause}
-          ${journalClause}
-          ${openAccessClause}
-        ORDER BY
-          ts_rank(
-            to_tsvector('english',
-              coalesce(title, '') || ' ' || coalesce(abstract, '')),
-            to_tsquery('english', ${tsQuery})
-          ) DESC,
-          "citationCount" DESC
-        LIMIT 50
+        WITH fts AS (
+          SELECT id, title, authors, year, journal, abstract, "isOpenAccess",
+                 "citationCount", "pdfUrl", url, fields, search_vector
+          FROM "Paper"
+          WHERE search_vector @@ to_tsquery('english', ${tsQuery})
+            ${yearClause} ${journalClause} ${openAccessClause}
+          OFFSET 0
+        ),
+        hits AS (
+          SELECT * FROM fts ORDER BY "citationCount" DESC LIMIT 300
+        )
+        SELECT id, title, authors, year, journal, abstract, "isOpenAccess",
+               "citationCount", "pdfUrl", url, fields
+        FROM hits
+        ORDER BY ts_rank(search_vector, to_tsquery('english', ${tsQuery})) DESC,
+                 "citationCount" DESC
+        LIMIT 30
       `);
     } catch (err) {
       // to_tsquery throws on malformed input (e.g. when the english
-      // dictionary drops all tokens as stopwords). Fall back to ILIKE
-      // — slower but defensible, won't 500 the route.
-      console.error("[search] FTS failed, ILIKE fallback:", (err as Error).message);
-      papers = (await prisma.paper.findMany({
-        where: {
-          OR: [
-            { title: { contains: topic, mode: "insensitive" } },
-            { abstract: { contains: topic, mode: "insensitive" } },
-          ],
-        },
-        take: 50,
-        orderBy: [{ citationCount: "desc" }, { publishedAt: "desc" }],
-        select: {
-          id: true, title: true, authors: true, year: true, journal: true,
-          abstract: true, isOpenAccess: true, citationCount: true,
-          pdfUrl: true, url: true, fields: true,
-        },
-      })) as PaperRow[];
+      // dictionary drops all tokens as stopwords). plainto_tsquery is
+      // forgiving, and stays on the indexed search_vector column so
+      // we never seq-scan via ILIKE.
+      console.error("[search] to_tsquery failed, plainto fallback:", (err as Error).message);
+      papers = await prisma.$queryRaw<PaperRow[]>(Prisma.sql`
+        SELECT id, title, authors, year, journal, abstract, "isOpenAccess",
+               "citationCount", "pdfUrl", url, fields
+        FROM "Paper"
+        WHERE search_vector @@ plainto_tsquery('english', ${topic})
+          ${yearClause} ${journalClause} ${openAccessClause}
+        ORDER BY "citationCount" DESC
+        LIMIT 30
+      `);
     }
   }
 

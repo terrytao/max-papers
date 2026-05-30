@@ -28,6 +28,8 @@ model Paper {
   keywords      String[]
   submittedVia  String?  @default("agent")
   publishedAt   DateTime?
+  // Maintained by trigger + GIN-indexed (agents/add-search-vector.ts).
+  search_vector Unsupported("tsvector")?
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 

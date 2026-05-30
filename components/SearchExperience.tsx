@@ -257,6 +257,11 @@ export function SearchExperience() {
     }
   }
 
+  function flushSearch() {
+    if (searchDebounce.current) clearTimeout(searchDebounce.current);
+    search(activeFilters ?? undefined);
+  }
+
   function pickMatchMode(mode: "AND" | "OR") {
     setMatchMode(mode);
     if (activeFilters) {
@@ -398,6 +403,7 @@ export function SearchExperience() {
               onChange={(v) => updateFilter("topic", v || null)}
               suggestions={activeFilters?.suggestions?.topics ?? []}
               onPick={(s) => updateFilter("topic", s, { immediate: true })}
+              onEnter={flushSearch}
             />
 
             <FilterField
@@ -407,6 +413,7 @@ export function SearchExperience() {
               onChange={(v) => updateFilter("author", v || null)}
               suggestions={activeFilters?.suggestions?.authors ?? []}
               onPick={(s) => updateFilter("author", s, { immediate: true })}
+              onEnter={flushSearch}
             />
 
             <div style={{ marginBottom: 14 }}>
@@ -455,6 +462,7 @@ export function SearchExperience() {
               onChange={(v) => updateFilter("journal", v || null)}
               suggestions={activeFilters?.suggestions?.journals ?? []}
               onPick={(s) => updateFilter("journal", s, { immediate: true })}
+              onEnter={flushSearch}
             />
 
             <div style={{ marginBottom: 14 }}>
@@ -1257,6 +1265,7 @@ function FilterField({
   onChange,
   suggestions,
   onPick,
+  onEnter,
 }: {
   label: string;
   value: string;
@@ -1264,6 +1273,7 @@ function FilterField({
   onChange: (v: string) => void;
   suggestions: string[];
   onPick: (v: string) => void;
+  onEnter?: () => void;
 }) {
   return (
     <div style={{ marginBottom: 14 }}>
@@ -1271,6 +1281,7 @@ function FilterField({
       <input
         value={value}
         onChange={(e) => onChange(e.target.value)}
+        onKeyDown={(e) => { if (e.key === "Enter") onEnter?.(); }}
         placeholder={placeholder}
         style={fieldInputStyle}
       />

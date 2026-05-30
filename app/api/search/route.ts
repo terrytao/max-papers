@@ -196,19 +196,19 @@ async function searchByAuthor(author: string): Promise<Set<string>> {
     .map((p) => p.replace(/[.,;]/g, ""))
     .filter((p) => p.length > 1);
   if (parts.length === 0) return new Set();
-  const esc = (s: string) => s.replace(/[\\%_]/g, (c) => `\\${c}`);
-  // ILIKE on paper_authors_text(authors) — our IMMUTABLE SQL wrapper
-  // around array_to_string. Routes both reads and the trigram index
-  // (Paper_authors_trgm_idx) through the same expression so the
-  // planner picks the index. The old unnest EXISTS form couldn't be
-  // index-backed at 6M rows.
   const joined = Prisma.sql`paper_authors_text(authors)`;
-  const likeClauses = parts.map(
-    (p) => Prisma.sql`${joined} ILIKE ${`%${esc(p)}%`}`,
+  // Whole-word, no partials: "hint" must NOT match "hinton". Each token
+  // required (AND), order-independent. \m=word start, \M=word end. ~*
+  // still uses the pg_trgm GIN index (Paper_authors_trgm_idx).
+  const escRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const clauses = parts.map(
+    (p) => Prisma.sql`${joined} ~* ${"\\m" + escRe(p) + "\\M"}`,
   );
-  const conjunction = Prisma.join(likeClauses, " AND ");
+  const conjunction = Prisma.join(clauses, " AND ");
   const rows = await prisma.$queryRaw<Array<{ id: string }>>(Prisma.sql`
-    SELECT id FROM "Paper" WHERE ${conjunction} LIMIT 500
+    SELECT id FROM "Paper"
+    WHERE ${conjunction}
+    LIMIT 500
   `);
   return new Set(rows.map((r) => r.id));
 }
